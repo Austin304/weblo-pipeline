@@ -32,6 +32,11 @@ git clone <your-repo-url> /tmp/site && cp -r /tmp/site/pipeline/. /opt/pipeline/
 "Upload file" to send a zip of the `pipeline/` folder, then unzip into
 `/opt/pipeline`.
 
+> If you **zip-upload from Windows** (option b) rather than `git clone`, the
+> shell script may carry CRLF line endings that break it. Normalize once on the
+> VM: `sudo apt install -y dos2unix && dos2unix /opt/pipeline/deploy/bootstrap.sh`.
+> A `git clone` on the VM is already correct (`.gitattributes` pins `*.sh` to LF).
+
 Either way you must also place the filled **`.env`** at `/opt/pipeline/.env`
 (it's gitignored, so it won't come from git — upload it separately via the same
 Upload-file menu, or paste it with `nano /opt/pipeline/.env`).
