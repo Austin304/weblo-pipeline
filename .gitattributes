@@ -1,0 +1,2 @@
+# Shell scripts must be LF — they run on the Linux VM; a CRLF shebang breaks them.
+*.sh text eol=lf
