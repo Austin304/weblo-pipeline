@@ -83,6 +83,12 @@ FOLLOWUP_AFTER_DAYS = get_int("FOLLOWUP_AFTER_DAYS", 6)
 CAMPAIGN_LOCATION = get("CAMPAIGN_LOCATION")
 CAMPAIGN_NICHE = get("CAMPAIGN_NICHE")
 CAMPAIGN_TARGET_COUNT = get_int("CAMPAIGN_TARGET_COUNT", 50)
+# Optional multi-area sweep (semicolon-separated, e.g.
+# "Plano, TX; Frisco, TX; Arlington, TX"). Legacy Places pagination is dead, so
+# breadth comes from searching several areas x niche-term variants. Falls back to
+# CAMPAIGN_LOCATION when unset.
+CAMPAIGN_AREAS = [a.strip() for a in (get("CAMPAIGN_AREAS", "") or "").split(";")
+                  if a.strip()]
 
 # --- models (doc 00: decided, do not re-litigate) ---
 MODEL_QUALITY = "claude-opus-4-8"          # sample HTML + email copy

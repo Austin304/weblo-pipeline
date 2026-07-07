@@ -139,6 +139,47 @@ def search_places(conn, query: str, max_results: int = 60) -> list[dict]:
     return out[:max_results]
 
 
+# Query-term variants per niche. Since pagination is dead, breadth comes from
+# running several phrasings (each ~20 results) and unioning them — this also
+# surfaces DIFFERENT businesses than a single ranked list would. Extend as new
+# niches are campaigned; the fallback is just the configured niche verbatim.
+NICHE_QUERY_VARIANTS = {
+    "med spa": ["med spa", "medical spa", "medical aesthetics", "botox clinic",
+                "aesthetic clinic", "injectables"],
+    "dentist": ["dentist", "dental office", "family dentistry",
+                "cosmetic dentist", "dental clinic"],
+    "chiropractor": ["chiropractor", "chiropractic clinic", "spine clinic"],
+    "law": ["law firm", "attorney", "lawyer", "legal office"],
+    "accountant": ["accountant", "cpa firm", "tax preparation", "bookkeeping"],
+}
+
+
+def niche_queries(niche: str) -> list[str]:
+    key = (niche or "").strip().lower()
+    for k, variants in NICHE_QUERY_VARIANTS.items():
+        if k in key or key in k:
+            return variants
+    return [niche] if niche else []
+
+
+def search_area(conn, niche: str, location: str) -> list[dict]:
+    """All distinct places for a niche in one area, across term variants.
+
+    max_results=20 so we take just page 1 per query (pagination is dead) and
+    don't waste a call attempting page 2."""
+    seen, out = set(), []
+    for term in niche_queries(niche):
+        for p in search_places(conn, f"{term} in {location}", max_results=20):
+            pid = p.get("id")
+            if pid and pid not in seen:
+                seen.add(pid)
+                out.append(p)
+        time.sleep(0.3)  # small courtesy gap between queries
+    log.info("search_area %s / %s: %d distinct places across %d queries",
+             niche, location, len(out), len(niche_queries(niche)))
+    return out
+
+
 def place_details(conn, place_id: str) -> dict:
     """Details call — the expensive one; provides phone/website/reviews/photos."""
     if costs.check(conn, "places", costs.PLACES_DETAILS_USD) == "block":
@@ -456,8 +497,17 @@ def top_up(location: str | None = None, niche: str | None = None,
             log.info("funnel already at target (%s QUALIFIED)", have)
             return stats
 
-        places = search_places(conn, f"{niche} in {location}")
+        areas = config.CAMPAIGN_AREAS or [location]
+        seen_ids, places = set(), []
+        for area in areas:
+            for p in search_area(conn, niche, area):
+                pid = p.get("id")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    places.append(p)
         stats["searched"] = len(places)
+        log.info("find: %d distinct places across %d area(s) for '%s'",
+                 len(places), len(areas), niche)
         for place in places:
             if stats["qualified"] >= need:
                 break
