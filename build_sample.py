@@ -4,10 +4,10 @@ Quality engine per sample-design-system.md: image ladder, per-niche art
 direction, layout archetypes, gap-fixing, multi-pass generate -> critique.
 Publishing = writing samples_cache/<slug>/index.html for serve_samples.py.
 """
-import hashlib
 import json
 import logging
 import re
+import secrets
 from urllib.parse import urlparse
 
 import requests
@@ -152,15 +152,22 @@ def slugify(lead) -> str:
     if m:
         city = m.group(1).strip()
     base = re.sub(r"[^a-z0-9]+", "-", f"{lead['business_name']} {city}".lower()).strip("-")
-    return base[:60] or f"lead-{lead['id']}"
+    return base[:48] or f"lead-{lead['id']}"
 
 
 def unique_slug(conn, lead) -> str:
-    slug = slugify(lead)
-    if db.get_lead_by_slug(conn, slug) is None:
-        return slug
-    suffix = hashlib.sha1(str(lead["id"]).encode()).hexdigest()[:6]
-    return f"{slug}-{suffix}"
+    """Readable business/city base + a random unguessable token.
+
+    This makes each sample link effectively private: the page is unlisted
+    (no index, bad slugs 404) AND the URL can't be guessed, so only the
+    recipient who was sent the exact link — by email or postcard — can open
+    it. token_hex(5) = 10 hex chars (~1e12 combinations)."""
+    base = slugify(lead)
+    for _ in range(5):
+        slug = f"{base}-{secrets.token_hex(5)}"
+        if db.get_lead_by_slug(conn, slug) is None:
+            return slug
+    return f"{base}-{secrets.token_hex(8)}"
 
 
 # --- Principle 1: image ladder --------------------------------------------
