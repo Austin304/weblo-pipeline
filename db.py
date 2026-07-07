@@ -321,10 +321,16 @@ def record_grade(conn, lead_id: int, factors: list[int], overall: int,
 
 
 def grade_averages(conn) -> dict:
-    """Mean of each factor + overall across all grades, with a count. Used to
-    watch calibration trend over the first ~30 samples."""
+    """Mean of each factor + overall across the LATEST grade per lead, so
+    re-grading one lead while iterating never skews the calibration numbers.
+    n = number of DISTINCT graded leads (the real calibration count)."""
     cols = ", ".join(f"AVG({f}) AS {f}" for f in (*GRADE_FACTORS, "overall"))
-    row = conn.execute(f"SELECT COUNT(*) AS n, {cols} FROM grades").fetchone()
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n, {cols} FROM ("
+        "  SELECT g.* FROM grades g"
+        "  JOIN (SELECT lead_id, MAX(id) AS mid FROM grades GROUP BY lead_id) last"
+        "    ON g.id = last.mid)"
+    ).fetchone()
     return dict(row) if row else {}
 
 
