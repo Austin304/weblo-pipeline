@@ -44,8 +44,29 @@ def main():
         print(find_leads.top_up())
     elif job == "build":
         import build_sample
-        limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), 10)
-        print(build_sample.build_samples(limit))
+        rest = sys.argv[2:]
+        if rest and rest[0] == "id":  # build specific leads: build id 12 27 ...
+            ids = [int(a) for a in rest[1:] if a.isdigit()]
+            stats = {"built": 0, "failed": 0}
+            with db.connect() as conn:
+                for lid in ids:
+                    lead = db.get_lead(conn, lid)
+                    if lead is None:
+                        print(f"lead {lid} not found")
+                        continue
+                    try:
+                        ok = build_sample.build_one(conn, lead)
+                        stats["built" if ok else "failed"] += 1
+                        row = db.get_lead(conn, lid)
+                        print(f"lead {lid} ({lead['business_name']}): "
+                              f"{'BUILT ' + (row['sample_url'] or '') if ok else 'FAILED'}")
+                    except Exception:
+                        logging.getLogger(__name__).exception("build_one crashed %s", lid)
+                        stats["failed"] += 1
+            print(stats)
+        else:
+            limit = next((int(a) for a in rest if a.isdigit()), 10)
+            print(build_sample.build_samples(limit))
     elif job == "draft":
         import send_email
         limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), 30)
