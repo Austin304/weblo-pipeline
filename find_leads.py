@@ -34,6 +34,24 @@ FREE_SITE_HOSTS = ("wixsite.com", "weebly.com", "godaddysites.com",
                    "business.site", "square.site", "wordpress.com")
 FRANCHISE_HINTS = ("franchise", "corporate")
 
+# Domain-parking / for-sale hosts + on-page markers. A parked domain means the
+# business has NO real site (the listing's "website" is just a placeholder), so
+# it must qualify as NO_SITE, never OUTDATED — otherwise the empty parking stub
+# (no viewport meta) trips the "not responsive" check and we pitch "your site is
+# outdated" to someone who knows they have no site at all.
+PARKING_HOSTS = ("sedoparking", "parkingcrew", "bodis", "afternic", "hugedomains",
+                 "dan.com", "uniregistry", "above.com", "sav.com", "domainmarket",
+                 "cashparking", "godaddy")
+PARKED_MARKERS = ("this domain is parked", "is parked free", "parked free, courtesy",
+                  "buy this domain", "the domain is for sale", "domain for sale",
+                  "domain is for sale", "get this domain", "courtesy of godaddy",
+                  "domain may be for sale", "/cgi-bin/parked", "parkingcrew",
+                  "sedoparking",
+                  # technical markers in raw HTML when the visible "parked" text
+                  # is JS-rendered (e.g. GoDaddy's /lander parking page)
+                  "parking-lander", "lander_system", 'ap:"parking"',
+                  "wsimg.com/parking")
+
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 BAD_EMAIL_BITS = ("example.", "sentry", "wixpress", "@2x", ".png", ".jpg",
                   ".gif", "godaddy", "no-reply", "noreply", "yourdomain")
@@ -143,6 +161,36 @@ def fetch_site(url: str) -> tuple[requests.Response | None, str]:
         return None, type(e).__name__
 
 
+def looks_parked(resp, _followed: bool = False) -> bool:
+    """True if the fetched page is a parked / for-sale domain, not a real site.
+
+    Catches the common case of a real business whose listed "website" is just a
+    registrar placeholder. Many parkers (e.g. GoDaddy) serve a near-empty
+    JS-redirect shell to a `/lander`; since our fetch runs no JS we follow ONE
+    same-site hop to see the actual parking page before judging."""
+    host = urlparse(resp.url).netloc.lower()
+    if any(h in host for h in PARKING_HOSTS):
+        return True
+    body = (resp.text or "")[:8000]
+    low = body.lower()
+    if any(m in low for m in PARKED_MARKERS):
+        return True
+    if not _followed:
+        text_only = re.sub(r"<[^>]+>", "",
+                           re.sub(r"<script.*?</script>", " ", body,
+                                  flags=re.S | re.I)).strip()
+        if len(text_only) < 40:  # JS/meta-refresh shell hiding the real page
+            m = (re.search(r'location\.href\s*=\s*["\']([^"\']+)', body, re.I)
+                 or re.search(r'http-equiv=["\']refresh["\'][^>]*url=([^"\'>]+)',
+                              body, re.I))
+            if m:
+                nxt = requests.compat.urljoin(resp.url, m.group(1).strip())
+                sub, _ = fetch_site(nxt)
+                if sub is not None:
+                    return looks_parked(sub, _followed=True)
+    return False
+
+
 EST_AI_QUALIFY_USD = 0.02  # worst-case pre-call gate; real cost ~0.005 (Haiku)
 
 
@@ -224,6 +272,9 @@ def qualify(conn, place: dict) -> tuple[str, str]:
         return "SKIP", f"site blocked automated check (HTTP {resp.status_code})"
     if resp.status_code >= 400:
         return "NO_SITE", f"site dead (HTTP {resp.status_code})"
+    if looks_parked(resp):
+        # real business, no real site — the listing points at a parked domain
+        return "NO_SITE", "domain parked / for sale (no real website)"
 
     reasons = []
     final_url = resp.url or website
