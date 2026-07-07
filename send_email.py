@@ -192,6 +192,46 @@ def send_followups(dry_run: bool = False) -> dict:
     return stats
 
 
+def draft_emails(limit: int = 30, regenerate: bool = False) -> dict:
+    """Calibration helper: generate + store cold-email copy for SAMPLE_BUILT
+    leads WITHOUT sending, and print each for grading alongside its sample.
+
+    Needs no Gmail setup. In production only email_status='found' leads are
+    actually sent; drafts are generated for all built samples so the copy
+    generator itself can be graded. The CAN-SPAM footer + opt-out line is
+    appended at real send time (see canspam_footer), not shown here."""
+    stats = {"generated": 0, "reused": 0, "failed": 0}
+    with db.connect() as conn:
+        leads = [l for l in db.get_leads_by_status(conn, "SAMPLE_BUILT")
+                 if l["sample_url"]]
+        for lead in leads[:limit]:
+            subject, body = lead["email_subject"], lead["email_body"]
+            if regenerate or not (subject and body):
+                copy = write_email.write_cold_email(conn, lead)
+                if copy is None:
+                    stats["failed"] += 1
+                    continue
+                subject, body = copy
+                db.update_lead(conn, lead["id"], email_subject=subject,
+                               email_body=body)
+                conn.commit()
+                stats["generated"] += 1
+            else:
+                stats["reused"] += 1
+            flag = "EMAIL" if lead["email_status"] == "found" else "postcard-only"
+            print("\n" + "=" * 70)
+            print(f"#{lead['id']}  {lead['business_name']}   [{flag}]")
+            print(f"sample: {lead['sample_url']}")
+            print(f"words:  {len(body.split())}")
+            print("-" * 70)
+            print(f"Subject: {subject}\n")
+            print(body)
+        print("\n" + "=" * 70)
+        print(f"draft summary: {stats}")
+        print("(a physical-address + 'Reply STOP to opt out' footer is added at send time)")
+    return stats
+
+
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
@@ -199,5 +239,8 @@ if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
     if "followups" in sys.argv:
         print(send_followups(dry_run=dry))
+    elif "draft" in sys.argv:
+        n = next((int(a) for a in sys.argv[1:] if a.isdigit()), 30)
+        draft_emails(limit=n, regenerate="--regenerate" in sys.argv)
     else:
         print(send_batch(dry_run=dry))

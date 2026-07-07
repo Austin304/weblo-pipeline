@@ -2,6 +2,7 @@
 
   python run.py find                 # weekly top-up (standing campaign config)
   python run.py build [limit]        # hourly: build samples for QUALIFIED leads
+  python run.py draft [limit]        # calibration: write+print emails, NO send
   python run.py send [--dry-run]     # every few minutes, business hours
   python run.py followups [--dry-run]
   python run.py status               # print funnel counts + MTD spend
@@ -44,6 +45,10 @@ def main():
         import build_sample
         limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), 10)
         print(build_sample.build_samples(limit))
+    elif job == "draft":
+        import send_email
+        limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), 30)
+        send_email.draft_emails(limit=limit, regenerate="--regenerate" in sys.argv)
     elif job == "send":
         import send_email
         print(send_email.send_batch(dry_run=dry))
