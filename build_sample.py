@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import secrets
+from collections import Counter
 from urllib.parse import urlparse
 
 import requests
@@ -129,7 +130,8 @@ ARCHETYPES = [
     "MENU/SERVICES-FORWARD — minimal hero; the services/menu list is the first real block",
 ]
 
-RUBRIC = """- Bespoke, not templated: looks designed for THIS business (most important)
+RUBRIC = """- Bespoke, not templated: looks designed for THIS business, and USES their real
+  brand (logo + colors) when provided — not a generic per-niche palette (most important)
 - Hero lands: a real marketing HEADLINE + one strong CTA over imagery in the first
   screen — NOT an app-store-style card (stacked name + description + star-rating badge)
 - Not basic: premium feel, whitespace, clear type scale, section variety (not a plain
@@ -137,7 +139,8 @@ RUBRIC = """- Bespoke, not templated: looks designed for THIS business (most imp
 - Real & specific: real name, services, review quotes, contact; zero invented facts
 - Imagery: a real, good photo present and well-placed (not a gradient default)
 - Visual craft: balanced spacing, consistent type scale, sufficient contrast
-- Beats their current site: visibly fixes the recorded weakness
+- Beats their current site WITHOUT A DOUBT: a clear, major upgrade — if it only reads
+  as comparable or marginally better than a dated small-business site, this scores low
 - Mobile: responsive, no horizontal scroll, tap targets big enough"""
 
 
@@ -236,6 +239,96 @@ def select_images(conn, lead, profile: dict) -> tuple[list[str], str]:
     return [], "typographic"
 
 
+def _norm_hex(h: str) -> str:
+    h = h.lower().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    return "#" + h
+
+
+def _is_neutral(h: str) -> bool:
+    """Near-gray/black/white — not a brand accent color."""
+    r, g, b = int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+    return max(r, g, b) - min(r, g, b) < 24
+
+
+def extract_brand(website: str) -> dict:
+    """Pull the business's REAL brand from their existing site — logo, accent
+    colors, fonts — so the sample looks like THEIRS, not a generic template.
+    Returns {} when nothing usable (no site / parked domain / fetch fails)."""
+    if not website:
+        return {}
+    try:
+        r = requests.get(website, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+    except requests.RequestException:
+        return {}
+    if r.status_code >= 400 or not r.text:
+        return {}
+    soup = BeautifulSoup(r.text, "lxml")
+    base, brand = r.url, {}
+
+    # logo: an <img> that looks like a logo, else apple-touch-icon / og:image
+    for img in soup.find_all("img", src=True):
+        cls = " ".join(img.get("class") or [])
+        hay = f"{img.get('alt','')} {cls} {img.get('id','')} {img.get('src','')}".lower()
+        if "logo" in hay:
+            brand["logo"] = requests.compat.urljoin(base, img["src"])
+            break
+    if "logo" not in brand:
+        icon = soup.find("link", rel=lambda v: v and "apple-touch-icon" in v)
+        og = soup.find("meta", property="og:image")
+        if icon and icon.get("href"):
+            brand["logo"] = requests.compat.urljoin(base, icon["href"])
+        elif og and og.get("content"):
+            brand["logo"] = requests.compat.urljoin(base, og["content"])
+
+    # colors: theme-color + hex codes across <style>, inline styles, up to 2 CSS files
+    css = " ".join(s.get_text() for s in soup.find_all("style"))
+    css += " " + " ".join(t.get("style", "") for t in soup.find_all(style=True))
+    tc = soup.find("meta", attrs={"name": "theme-color"})
+    theme = (tc.get("content", "") if tc else "").strip()
+    for link in soup.find_all("link", rel=lambda v: v and "stylesheet" in v,
+                              href=True)[:2]:
+        try:
+            cr = requests.get(requests.compat.urljoin(base, link["href"]),
+                              timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            if cr.status_code < 400:
+                css += " " + cr.text[:200_000]
+        except requests.RequestException:
+            pass
+    counts = Counter(_norm_hex(h) for h in
+                     re.findall(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b",
+                                theme + " " + css))
+    colors = [h for h, _ in counts.most_common(30) if not _is_neutral(h)][:4]
+    if theme.startswith("#"):
+        t = _norm_hex(theme)
+        colors = [t] + [c for c in colors if c != t]
+    if colors:
+        brand["colors"] = colors[:4]
+
+    # fonts: Google Fonts families + font-family declarations
+    fonts = []
+    for link in soup.find_all("link", href=True):
+        m = re.search(r"fonts\.googleapis\.com/css2?\?family=([^:&\"']+)",
+                      link["href"])
+        if m:
+            fonts.append(m.group(1).replace("+", " "))
+    for f in re.findall(r"font-family:\s*([^;}{\"']+)", css, re.I)[:10]:
+        first = re.sub(r"\s*!important\s*$", "",
+                       f.split(",")[0].strip().strip("'\""), flags=re.I).strip()
+        low = first.lower()
+        if (first and low not in (
+                "inherit", "initial", "unset", "none", "sans-serif", "serif",
+                "monospace", "system-ui", "-apple-system", "var")
+                and not any(bad in low for bad in ("icon", "awesome", "glyph"))
+                and first not in fonts):
+            fonts.append(first)
+    if fonts:
+        brand["fonts"] = fonts[:3]
+
+    return brand
+
+
 # --- Principles 4-5: prompt + multi-pass -----------------------------------
 
 def _claude():
@@ -266,12 +359,42 @@ def _call_claude(conn, system: str, user: str, lead_id: int,
 
 
 def build_prompt(lead, brief: dict, archetype: str, images: list[str],
-                 profile: dict) -> str:
+                 profile: dict, brand: dict) -> str:
     image_block = "\n".join(
         f"  {i+1}. {url}  (role: {'hero' if i == 0 else 'supporting'})"
         for i, url in enumerate(images)
     ) or ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
           "gradient background. Never use a broken <img> or an invented URL.")
+    if brand:
+        parts = []
+        if brand.get("logo"):
+            parts.append(f"  Their real logo — place it in the header/nav: {brand['logo']}")
+        if brand.get("colors"):
+            parts.append("  Their brand colors — build the ENTIRE palette around these, "
+                         f"do NOT override with generic niche defaults: {', '.join(brand['colors'])}")
+        if brand.get("fonts"):
+            parts.append("  Their fonts — use these (or the closest Google Font): "
+                         f"{', '.join(brand['fonts'])}")
+        brand_block = ("THEIR EXISTING BRAND (highest priority — the sample must read as "
+                       "THIS business's own site, not a template):\n" + "\n".join(parts))
+    else:
+        brand_block = ("THEIR BRAND: no usable existing brand (no real site). INVENT a "
+                       "distinctive identity for THIS specific business — a palette and type "
+                       "system that feel chosen for them by name/personality, never a generic "
+                       "niche default.")
+    if lead["qualify_status"] == "OUTDATED":
+        upgrade_mandate = (
+            "WITHOUT-A-DOUBT UPGRADE: they ALREADY have a website, so this sample must be "
+            "so obviously better that the owner sees an unmistakable leap — not a lateral "
+            "move. Modern responsive layout, a commanding hero, confident type scale, real "
+            "polish and speed. Keep their brand identity (logo/colors above) but execute it "
+            "at a dramatically higher level. A result a reasonable person could call merely "
+            "comparable or only slightly better than a dated small-business site is a FAILURE.")
+    else:
+        upgrade_mandate = (
+            "ESTABLISH THEIR PRESENCE: they have no real website today. This is their first "
+            "real web presence — make it genuinely impressive and credible, the kind of site "
+            "that makes this business look established and trustworthy at a glance.")
     business = {
         "name": lead["business_name"], "category": lead["category"],
         "phone": lead["phone"], "address": lead["address"],
@@ -284,8 +407,8 @@ Generate ONE complete, single-file, responsive HTML page (inline CSS, minimal/no
 
 DESIGN DIRECTION (niche category: {lead['category']}):
   Mood: {brief['mood']}
-  Palette direction: {brief['palette']}      (choose specific values in this direction)
-  Type pairing: {brief['type_pairing']} (system fonts or ONE Google Font)
+  Palette direction: {brief['palette']} — BUT if THEIR BRAND below gives colors, THOSE win
+  Type pairing: {brief['type_pairing']} — BUT if THEIR BRAND below gives fonts, use those
   Lead with: {brief['leading_section']}
   Primary CTA: {brief['primary_cta']}
   Imagery style: {brief['imagery']}
@@ -294,6 +417,8 @@ IMAGES TO USE (real, already selected — place them well; do not invent others)
 {image_block}
 THEIR CURRENT SITE'S WEAKNESS: {lead['qualify_reason'] or 'no web presence at all'}
   -> This sample must visibly FIX that weakness.
+{brand_block}
+{upgrade_mandate}
 
 HERO (get this right — it's the first impression): lead with a strong, specific
 marketing HEADLINE — a benefit or hook written for THIS business — set over a large
@@ -333,7 +458,7 @@ THE BUSINESS: {lead['business_name']} ({lead['category']})
 THE WEAKNESS THIS MUST FIX: {lead['qualify_reason'] or 'no web presence'}
 
 Return STRICT JSON only: {{"verdict": "PASS" or "FAIL", "scores": {{...}}, "fixes": ["specific fix", ...]}}
-FAIL if any of bespoke / hero / mobile / imagery scores below 4.
+FAIL if any of bespoke / hero / not-basic / beats / mobile / imagery scores below 4.
 
 HTML:
 {html[:60000]}"""
@@ -390,8 +515,14 @@ def build_one(conn, lead) -> bool:
     brief = niche_brief(lead["category"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
     images, image_source = select_images(conn, lead, profile)
+    brand = extract_brand(lead["existing_website"]) if lead["existing_website"] else {}
+    if brand:
+        log.info("lead %s brand: colors=%s fonts=%s logo=%s", lead["id"],
+                 brand.get("colors"), brand.get("fonts"), bool(brand.get("logo")))
+    # the real logo is a legitimate image even if it isn't in the photo `images`
+    allowed_images = images + ([brand["logo"]] if brand.get("logo") else [])
 
-    prompt = build_prompt(lead, brief, archetype, images, profile)
+    prompt = build_prompt(lead, brief, archetype, images, profile, brand)
     html, failure = None, "no attempts made"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         raw = _call_claude(conn, "You are an expert web designer.", prompt,
@@ -400,7 +531,7 @@ def build_one(conn, lead) -> bool:
             failure = "claude budget blocked"
             break
         candidate = extract_html(raw)
-        failure = structural_gate(candidate, lead, images)
+        failure = structural_gate(candidate, lead, allowed_images)
         if failure:
             log.info("lead %s attempt %s failed gate: %s", lead["id"], attempt, failure)
             prompt += f"\n\nPREVIOUS ATTEMPT FAILED THE QUALITY GATE: {failure}. Fix that."
