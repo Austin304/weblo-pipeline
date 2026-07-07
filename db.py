@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,
   value TEXT
 );
+
+-- one row per message actually sent (cold OR followup). The daily send cap is
+-- counted from HERE so follow-ups and cold sends share one budget — a warming
+-- domain's per-day volume must include every message, not just cold sends.
+CREATE TABLE IF NOT EXISTS send_log (
+  id        INTEGER PRIMARY KEY,
+  lead_id   INTEGER NOT NULL,
+  kind      TEXT NOT NULL,   -- cold | followup
+  sent_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_send_log_day ON send_log(sent_at);
 """
 
 VALID_TRANSITIONS = {
@@ -263,11 +274,22 @@ def counts_by_status(conn) -> dict:
     return {r["status"]: r["n"] for r in rows}
 
 
+def record_send(conn, lead_id: int, kind: str):
+    """Log one actually-sent message for daily-cap accounting. `kind` is
+    'cold' or 'followup' — both count against the same daily budget."""
+    conn.execute(
+        "INSERT INTO send_log (lead_id, kind, sent_at) VALUES (?,?,?)",
+        (lead_id, kind, now()),
+    )
+
+
 def sent_today(conn) -> int:
-    """Emails sent in the current UTC day (cap accounting)."""
+    """Every message (cold + followup) sent in the current UTC day. This is the
+    number the daily send cap is enforced against, so follow-ups and cold sends
+    can never together exceed DAILY_SEND_CAP from a warming domain."""
     today = now()[:10]
     return conn.execute(
-        "SELECT COUNT(*) FROM leads WHERE emailed_at LIKE ?", (f"{today}%",)
+        "SELECT COUNT(*) FROM send_log WHERE sent_at LIKE ?", (f"{today}%",)
     ).fetchone()[0]
 
 

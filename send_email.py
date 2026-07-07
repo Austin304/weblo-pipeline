@@ -140,6 +140,7 @@ def send_batch(limit: int | None = None, dry_run: bool = False) -> dict:
                           emailed_at=db.now(),
                           gmail_thread_id=resp.get("threadId"),
                           gmail_message_id=resp.get("id"))
+            db.record_send(conn, lead["id"], "cold")
             conn.commit()
             stats["sent"] += 1
             if stats["sent"] < len(batch):
@@ -183,6 +184,7 @@ def send_followups(dry_run: bool = False) -> dict:
                 log.exception("followup failed for lead %s", lead["id"])
                 continue
             db.update_lead(conn, lead["id"], followups_sent=1)
+            db.record_send(conn, lead["id"], "followup")
             conn.commit()
             stats["sent"] += 1
             time.sleep(random.uniform(60, 120))

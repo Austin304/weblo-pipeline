@@ -171,10 +171,14 @@ say "STEP 7 — cron batch jobs (run.py job names; postcards/mail_job deferred)"
 CRON_TMP="$(mktemp)"
 cat > "$CRON_TMP" <<CRON
 # Weblo pipeline — times UTC; per-lead 9-5 local window + cap + spacing enforced in code.
-*/3  *     * * *  cd ${APP_DIR} && .venv/bin/python run.py send      >> logs/cron.log 2>&1
-17   *     * * *  cd ${APP_DIR} && .venv/bin/python run.py build     >> logs/cron.log 2>&1
-30   13    * * 1  cd ${APP_DIR} && .venv/bin/python run.py find      >> logs/cron.log 2>&1
-0    14    * * *  cd ${APP_DIR} && .venv/bin/python run.py followups >> logs/cron.log 2>&1
+# flock -n = single-flight: skip this tick if a run is still going (a send batch
+# can take ~15 min with pacing, and cron fires every 3 min). send + followups
+# SHARE one lock so their sends can never overlap and together overshoot the
+# daily cap. flock releases automatically when the process exits, even on crash.
+*/3  *     * * *  cd ${APP_DIR} && flock -n /tmp/weblo-send.lock  .venv/bin/python run.py send      >> logs/cron.log 2>&1
+17   *     * * *  cd ${APP_DIR} && flock -n /tmp/weblo-build.lock .venv/bin/python run.py build     >> logs/cron.log 2>&1
+30   13    * * 1  cd ${APP_DIR} && flock -n /tmp/weblo-find.lock  .venv/bin/python run.py find      >> logs/cron.log 2>&1
+0    14    * * *  cd ${APP_DIR} && flock -n /tmp/weblo-send.lock  .venv/bin/python run.py followups >> logs/cron.log 2>&1
 CRON
 crontab -u "$SVC_USER" "$CRON_TMP"
 rm -f "$CRON_TMP"
