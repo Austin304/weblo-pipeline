@@ -6,6 +6,7 @@
   python run.py send [--dry-run]     # every few minutes, business hours
   python run.py followups [--dry-run]
   python run.py status               # print funnel counts + MTD spend
+  python run.py grade <id> <ABCDEFG> <overall> [note]   # log a manual sample grade
 
 The two long-running processes are separate systemd services:
   python serve_samples.py   and   python watch_replies.py
@@ -55,6 +56,41 @@ def main():
     elif job == "followups":
         import send_email
         print(send_email.send_followups(dry_run=dry))
+    elif job == "grade":
+        # grade <lead_id> <ABCDEFG scores, each 1-5> <overall /10> [note...]
+        if len(sys.argv) < 5:
+            print("usage: run.py grade <lead_id> <ABCDEFG> <overall> [note]\n"
+                  "  ABCDEFG = 7 digits 1-5 (hero design layout imagery copy trust beats)\n"
+                  "  example: run.py grade 18 5443454 7 'CHANGE: kill hero badge | KEEP: real photos'")
+            sys.exit(1)
+        lead_id = int(sys.argv[2])
+        scores = sys.argv[3]
+        if len(scores) != 7 or any(c not in "12345" for c in scores):
+            print(f"bad scores {scores!r}: need exactly 7 digits, each 1-5")
+            sys.exit(1)
+        factors = [int(c) for c in scores]
+        overall = int(sys.argv[4])
+        notes = " ".join(sys.argv[5:])
+        with db.connect() as conn:
+            lead = db.get_lead(conn, lead_id)
+            if lead is None:
+                print(f"lead {lead_id} not found")
+                sys.exit(1)
+            db.record_grade(conn, lead_id, factors, overall,
+                            notes, lead["sample_slug"])
+            conn.commit()
+            labels = ["hero", "design", "layout", "imagery", "copy", "trust", "beats"]
+            print(f"graded lead {lead_id} ({lead['business_name']}), "
+                  f"build {lead['sample_slug']}:")
+            print("  " + "  ".join(f"{l}={s}" for l, s in zip(labels, factors))
+                  + f"  | overall={overall}/10")
+            if notes:
+                print(f"  {notes}")
+            avg = db.grade_averages(conn)
+            if avg.get("n"):
+                print(f"\nacross {avg['n']} graded sample(s):")
+                print("  " + "  ".join(
+                    f"{l}={avg[l]:.1f}" for l in (*labels, "overall") if avg.get(l) is not None))
     elif job == "status":
         with db.connect() as conn:
             import costs

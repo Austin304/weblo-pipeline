@@ -122,7 +122,30 @@ CREATE TABLE IF NOT EXISTS send_log (
   sent_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_send_log_day ON send_log(sent_at);
+
+-- Manual sample grades (calibration, first ~30 samples). One row per grading
+-- pass; the seven factors A-G each 1-5 (see GRADING-RUBRIC.md), overall is a
+-- gut /10 kept separate on purpose. sample_slug pins WHICH build was graded,
+-- since a rebuild mints a new slug.
+CREATE TABLE IF NOT EXISTS grades (
+  id           INTEGER PRIMARY KEY,
+  lead_id      INTEGER NOT NULL,
+  hero         INTEGER,   -- A: first 3 seconds
+  design       INTEGER,   -- B: premium vs basic craft
+  layout       INTEGER,   -- C: layout & variety
+  imagery      INTEGER,   -- D: imagery use
+  copy         INTEGER,   -- E: copy / voice
+  trust        INTEGER,   -- F: accuracy / owner's eye
+  beats        INTEGER,   -- G: beats their current site
+  overall      INTEGER,   -- gut /10
+  notes        TEXT,      -- "CHANGE FIRST: ... | KEEP: ..."
+  sample_slug  TEXT,
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_grades_lead ON grades(lead_id);
 """
+
+GRADE_FACTORS = ("hero", "design", "layout", "imagery", "copy", "trust", "beats")
 
 VALID_TRANSITIONS = {
     "FOUND": {"QUALIFIED", "SKIP", "PHONE_ONLY"},
@@ -281,6 +304,28 @@ def record_send(conn, lead_id: int, kind: str):
         "INSERT INTO send_log (lead_id, kind, sent_at) VALUES (?,?,?)",
         (lead_id, kind, now()),
     )
+
+
+def record_grade(conn, lead_id: int, factors: list[int], overall: int,
+                 notes: str, sample_slug: str | None) -> int:
+    """Store one manual grading pass. `factors` is the seven A-G scores in
+    order (see GRADE_FACTORS / GRADING-RUBRIC.md)."""
+    cols = ", ".join(GRADE_FACTORS)
+    marks = ", ".join("?" * len(GRADE_FACTORS))
+    cur = conn.execute(
+        f"INSERT INTO grades (lead_id, {cols}, overall, notes, sample_slug, created_at)"
+        f" VALUES (?, {marks}, ?, ?, ?, ?)",
+        (lead_id, *factors, overall, notes, sample_slug, now()),
+    )
+    return cur.lastrowid
+
+
+def grade_averages(conn) -> dict:
+    """Mean of each factor + overall across all grades, with a count. Used to
+    watch calibration trend over the first ~30 samples."""
+    cols = ", ".join(f"AVG({f}) AS {f}" for f in (*GRADE_FACTORS, "overall"))
+    row = conn.execute(f"SELECT COUNT(*) AS n, {cols} FROM grades").fetchone()
+    return dict(row) if row else {}
 
 
 def sent_today(conn) -> int:
