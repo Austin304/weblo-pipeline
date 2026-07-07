@@ -130,7 +130,10 @@ ARCHETYPES = [
 ]
 
 RUBRIC = """- Bespoke, not templated: looks designed for THIS business (most important)
-- Hero lands: clear what the business is + one strong action in the first screen
+- Hero lands: a real marketing HEADLINE + one strong CTA over imagery in the first
+  screen — NOT an app-store-style card (stacked name + description + star-rating badge)
+- Not basic: premium feel, whitespace, clear type scale, section variety (not a plain
+  centered text stack)
 - Real & specific: real name, services, review quotes, contact; zero invented facts
 - Imagery: a real, good photo present and well-placed (not a gradient default)
 - Visual craft: balanced spacing, consistent type scale, sufficient contrast
@@ -292,7 +295,19 @@ IMAGES TO USE (real, already selected — place them well; do not invent others)
 THEIR CURRENT SITE'S WEAKNESS: {lead['qualify_reason'] or 'no web presence at all'}
   -> This sample must visibly FIX that weakness.
 
-Required sections: hero with business name + what they do, services, why-choose-us,
+HERO (get this right — it's the first impression): lead with a strong, specific
+marketing HEADLINE — a benefit or hook written for THIS business — set over a large
+hero image, with the primary CTA nearby. Do NOT open with an "app-store card": a
+stacked business name + one-line description + a star-rating badge. That layout reads
+generic and templated. Star ratings and review counts belong in the testimonials
+section further down, never as a hero badge.
+CRAFT (avoid "basic"): make it feel premium and designed, not a plain vertical stack of
+centered text blocks. Use generous whitespace, a clear type scale (large confident
+headings, comfortable body), real visual variety between sections (alternating layouts,
+an image band, a stats or services grid), and thoughtful detail. Aim for "a designer
+made this for me," not "a competent template."
+
+Required sections: a hero (per HERO above), services, why-choose-us,
 testimonials pulled ONLY from the provided real reviews (lightly cleaned, attributed
 "— Google review"), hours/location, and a clear contact CTA using their real phone/address.
 Include <meta name="viewport">. Semantic HTML, alt text, sufficient contrast.
