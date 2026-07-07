@@ -3,6 +3,7 @@
 Implements find-leads-brief.md against the Places API (New, v1).
 Every paid call goes through the costs.check gate first.
 """
+import json
 import logging
 import re
 import time
@@ -142,7 +143,66 @@ def fetch_site(url: str) -> tuple[requests.Response | None, str]:
         return None, type(e).__name__
 
 
-def qualify(place: dict) -> tuple[str, str]:
+EST_AI_QUALIFY_USD = 0.02  # worst-case pre-call gate; real cost ~0.005 (Haiku)
+
+
+def _trim_html_for_ai(html: str, limit: int = 18000) -> str:
+    """Strip the noisy/huge parts (scripts, svg, inline data) so the model sees
+    structure + styling, and cap length to keep the call cheap."""
+    cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", html,
+                     flags=re.S | re.I)
+    cleaned = re.sub(r"<svg\b[^>]*>.*?</svg>", " ", cleaned, flags=re.S | re.I)
+    cleaned = re.sub(r"<!--.*?-->", " ", cleaned, flags=re.S)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned[:limit]
+
+
+def ai_looks_dated(conn, html: str, place: dict) -> str | None:
+    """Read the raw HTML (no rendering) and CONSERVATIVELY judge whether the
+    site looks dated/low-quality enough that a redesign clearly helps. Returns a
+    short reason if dated, else None. Catches visually-dated sites that pass the
+    technical checks — the qualifier's blind spot without a browser."""
+    if not config.ANTHROPIC_API_KEY:
+        return None
+    if costs.check(conn, "claude", EST_AI_QUALIFY_USD) == "block":
+        return None
+    snippet = _trim_html_for_ai(html)
+    if len(snippet) < 200:  # JS shell / near-empty — can't judge, don't guess
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        resp = client.messages.create(
+            model=config.MODEL_CLASSIFIER, max_tokens=200,
+            system="You judge whether a local business's existing website looks "
+                   "OUTDATED or low-quality from its raw HTML (no rendering). Be "
+                   "CONSERVATIVE: only say dated on CLEAR signals — table-based "
+                   "layout, <font>/inline formatting tags, no responsive CSS "
+                   "(flex/grid/media queries), ancient frameworks, pre-2015 design "
+                   "patterns, broken/sparse structure. If it looks like a competent "
+                   "modern site, say NOT dated. A false 'dated' causes a bad pitch, "
+                   "which is worse than skipping.",
+            messages=[{"role": "user", "content":
+                       f"Business: {(place.get('displayName') or {}).get('text','')}\n"
+                       f"Judge this site's HTML. Return STRICT JSON only: "
+                       f'{{"dated": true|false, "reason": "<=8 words"}}\n\nHTML:\n{snippet}'}],
+        )
+        costs.record(conn, "claude", "ai_qualify",
+                     costs.claude_cost(config.MODEL_CLASSIFIER,
+                                       resp.usage.input_tokens,
+                                       resp.usage.output_tokens))
+        conn.commit()
+        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+        if data.get("dated"):
+            return (data.get("reason") or "dated design").strip()[:60]
+    except (AttributeError, json.JSONDecodeError):
+        log.warning("ai_qualify unparseable response")
+    except Exception:
+        log.exception("ai_qualify failed")
+    return None
+
+
+def qualify(conn, place: dict) -> tuple[str, str]:
     """Returns (NO_SITE | OUTDATED | SKIP, reason)."""
     if place.get("businessStatus") not in (None, "OPERATIONAL"):
         return "SKIP", f"business_status={place.get('businessStatus')}"
@@ -186,6 +246,13 @@ def qualify(place: dict) -> tuple[str, str]:
 
     if reasons:
         return "OUTDATED", " + ".join(reasons[:3])
+
+    # technically clean — but the checks above can't SEE visual dating. Ask the
+    # model to read the HTML before we skip it (recovers dated-but-technically-ok
+    # sites; conservative so good sites still skip). Blind spot fix.
+    ai_reason = ai_looks_dated(conn, html, place)
+    if ai_reason:
+        return "OUTDATED", f"AI: {ai_reason}"
     return "SKIP", "site looks modern"
 
 
@@ -350,7 +417,7 @@ def top_up(location: str | None = None, niche: str | None = None,
                 stats["deduped"] += 1
                 continue
 
-            q_status, q_reason = qualify(place)
+            q_status, q_reason = qualify(conn, place)
             if q_status == "SKIP":
                 stats["skipped"] += 1
                 # store skips too, so re-runs don't re-fetch their site
