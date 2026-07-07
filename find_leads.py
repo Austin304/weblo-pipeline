@@ -89,31 +89,35 @@ BOT_BLOCK_STATUSES = {401, 403, 406, 429, 503}
 # ---------------------------------------------------------------- Places
 
 def search_places(conn, query: str, max_results: int = 60) -> list[dict]:
-    """Text Search (paginated). Returns place dicts in a normalized shape."""
-    out, token = [], None
+    """Text Search. Returns place dicts in a normalized shape.
+
+    NOTE: legacy next_page_token pagination is BROKEN for this project — the
+    token persistently returns INVALID_REQUEST regardless of wait or encoding
+    (Google has degraded the legacy API for newly-created projects; verified
+    2026-07-07). So one call yields ~20 results and breadth must come from
+    multiple query variants / areas at the top_up level, not pagination. We still
+    attempt one page-2 fetch cheaply in case Google ever restores it, then bail
+    fast rather than burning time on a token that won't work."""
+    out, token, page = [], None, 0
     while len(out) < max_results:
         if costs.check(conn, "places", costs.PLACES_TEXT_SEARCH_USD) == "block":
             log.warning("places budget blocked; stopping search early")
             break
         params = {"key": config.GOOGLE_PLACES_API_KEY}
+        params["pagetoken" if token else "query"] = token or query
         if token:
-            params["pagetoken"] = token
-            time.sleep(2)  # legacy API needs a beat before the next page is live
-        else:
-            params["query"] = query
-        data = {}
-        for attempt in range(5):
-            r = requests.get(PLACES_SEARCH_URL, params=params, timeout=30)
-            r.raise_for_status()
-            costs.record(conn, "places", "text_search",
-                         costs.PLACES_TEXT_SEARCH_USD)
-            data = r.json()
-            if token and data.get("status") == "INVALID_REQUEST":
-                time.sleep(3)  # page token not live yet — retry
-                continue
+            time.sleep(2)  # give the token a beat; bail below if still invalid
+        r = requests.get(PLACES_SEARCH_URL, params=params, timeout=30)
+        r.raise_for_status()
+        costs.record(conn, "places", "text_search", costs.PLACES_TEXT_SEARCH_USD)
+        data = r.json()
+        status = data.get("status")
+        if status == "INVALID_REQUEST" and token:
+            log.info("places pagination unavailable (next_page_token rejected); "
+                     "keeping %d results from page 1", len(out))
             break
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            log.warning("places search status %s: %s", data.get("status"),
+        if status not in ("OK", "ZERO_RESULTS"):
+            log.warning("places search status %s: %s", status,
                         (data.get("error_message") or "")[:200])
             break
         for res in data.get("results", []):
@@ -126,7 +130,10 @@ def search_places(conn, query: str, max_results: int = 60) -> list[dict]:
                 "businessStatus": res.get("business_status"),
                 "primaryType": (res.get("types") or [None])[0],
             })
+        page += 1
         token = data.get("next_page_token")
+        log.info("places page %s: +%d results (total %d); more=%s",
+                 page, len(data.get("results", [])), len(out), bool(token))
         if not token:
             break
     return out[:max_results]
