@@ -36,21 +36,45 @@ so the AI self-critique starts catching it before a human ever sees it. The goal
 is for `grade_averages` to climb across the first 30 and for the machine critique
 to converge with the human grades.
 
-Three tools close the loop mechanically (see `exemplars/README.md`):
+### The fast loop: `run.py review` (grade by exception)
 
 ```bash
-run.py vision 18 22 31    # laptop: Playwright screenshots + Opus VISION grade
-                          # per sample; prints a suggested grade command to
-                          # edit and paste (your judgment stays authoritative)
+run.py review 18 22 31 35 ...   # laptop: batch-renders every sample, has Opus
+                                # pre-grade each one, then opens ONE local page
+                                # (logs/review.html)
+run.py review 121=https://samples.webloapp.com/<slug>/ 77=https://...
+                                # id=url form for leads that only exist in the
+                                # VM DB (the laptop db doesn't need the lead)
+```
+
+The page shows each sample's screenshots (desktop fold, mobile fold, full
+page) beside 1-5 factor buttons **already set to the AI's grade**. Your job
+per sample is ~60 seconds: eyeball the screenshots, tap only the scores you
+disagree with, fix the CHANGE/KEEP notes if the AI's are off, star anything
+worth an exemplar. One button copies every `run.py grade` command — paste the
+block into the VM SSH once. Always sanity-check hero + overall yourself;
+those two carry the reply-rate signal.
+
+Each copied command carries `--vision` (what the AI predicted), so the DB
+accumulates human-vs-AI pairs. `run.py insights` reports per-factor agreement
+and flips to **CALIBRATED** once >=90% of factor scores land within +/-1 of
+yours across >=10 samples — from then on, spot-check ~1 in 5 samples and let
+the AI pre-grade stand for the rest. That convergence is the *point* of
+hand-grading: the goal is to stop needing to.
+
+Supporting tools (see `exemplars/README.md`):
+
+```bash
+run.py vision 18 22 31    # same AI grade, terminal-only (single-sample assist)
 run.py insights           # factor averages by niche / image source / archetype
-                          # + every CHANGE/KEEP note, worst-graded first
+                          # + AI-grader calibration + every CHANGE/KEEP note
 run.py exemplar 18        # distill a sample you graded 5s into a style crib
                           # injected into every future generation for its niche
 ```
 
-After each grading round: run `insights`, fold recurring CHANGE-FIRST notes
-into `exemplars/LESSONS.md` (hand-curated), and `exemplar` your best sample
-per niche.
+After each grading round (this is the machine's learning step — don't skip):
+run `insights`, fold recurring CHANGE-FIRST notes into `exemplars/LESSONS.md`
+(hand-curated), and `exemplar` your best sample per niche.
 
 ## Logging a grade
 

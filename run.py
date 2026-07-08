@@ -6,7 +6,9 @@
   python run.py send [--dry-run]     # every few minutes, business hours
   python run.py followups [--dry-run]
   python run.py status               # print funnel counts + MTD spend
-  python run.py grade <id> <ABCDEFG> <overall> [note]   # log a manual sample grade
+  python run.py grade <id> <ABCDEFG> <overall> [note] [--vision ABCDEFG:o]
+  python run.py review <id ...>      # laptop: batch vision-grade -> ONE local
+                                     # review page (prefilled buttons, copy-all)
   python run.py vision <id ...>      # laptop: screenshot + AI vision grade (assist)
   python run.py vision --url <url> [context]            # grade any live sample URL
   python run.py insights             # grade averages by niche/imagery/archetype + notes
@@ -83,26 +85,36 @@ def main():
         print(send_email.send_followups(dry_run=dry))
     elif job == "grade":
         # grade <lead_id> <ABCDEFG scores, each 1-5> <overall /10> [note...]
-        if len(sys.argv) < 5:
-            print("usage: run.py grade <lead_id> <ABCDEFG> <overall> [note]\n"
+        #       [--vision ABCDEFG:overall]   (the AI pre-grade, for calibration)
+        rest = sys.argv[2:]
+        vision = None
+        if "--vision" in rest:
+            i = rest.index("--vision")
+            if i + 1 >= len(rest):
+                print("--vision needs a value like 5443454:7")
+                sys.exit(1)
+            vision = rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
+        if len(rest) < 3:
+            print("usage: run.py grade <lead_id> <ABCDEFG> <overall> [note] [--vision ABCDEFG:o]\n"
                   "  ABCDEFG = 7 digits 1-5 (hero design layout imagery copy trust beats)\n"
                   "  example: run.py grade 18 5443454 7 'CHANGE: kill hero badge | KEEP: real photos'")
             sys.exit(1)
-        lead_id = int(sys.argv[2])
-        scores = sys.argv[3]
+        lead_id = int(rest[0])
+        scores = rest[1]
         if len(scores) != 7 or any(c not in "12345" for c in scores):
             print(f"bad scores {scores!r}: need exactly 7 digits, each 1-5")
             sys.exit(1)
         factors = [int(c) for c in scores]
-        overall = int(sys.argv[4])
-        notes = " ".join(sys.argv[5:])
+        overall = int(rest[2])
+        notes = " ".join(rest[3:])
         with db.connect() as conn:
             lead = db.get_lead(conn, lead_id)
             if lead is None:
                 print(f"lead {lead_id} not found")
                 sys.exit(1)
             db.record_grade(conn, lead_id, factors, overall,
-                            notes, lead["sample_slug"])
+                            notes, lead["sample_slug"], vision=vision)
             conn.commit()
             labels = ["hero", "design", "layout", "imagery", "copy", "trust", "beats"]
             print(f"graded lead {lead_id} ({lead['business_name']}), "
@@ -116,6 +128,9 @@ def main():
                 print(f"\nacross {avg['n']} graded sample(s):")
                 print("  " + "  ".join(
                     f"{l}={avg[l]:.1f}" for l in (*labels, "overall") if avg.get(l) is not None))
+    elif job == "review":
+        import calibrate
+        calibrate.review_command(sys.argv[2:])
     elif job == "vision":
         import calibrate
         calibrate.vision_command(sys.argv[2:])

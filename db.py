@@ -140,6 +140,9 @@ CREATE TABLE IF NOT EXISTS grades (
   overall      INTEGER,   -- gut /10
   notes        TEXT,      -- "CHANGE FIRST: ... | KEEP: ..."
   sample_slug  TEXT,
+  vision       TEXT,       -- AI pre-grade at grading time, 'ABCDEFG:overall' —
+                           -- lets insights measure how close the AI grader is
+                           -- to the human (the exit criterion for hand-grading)
   created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_grades_lead ON grades(lead_id);
@@ -174,6 +177,10 @@ def connect() -> sqlite3.Connection:
 def init_db():
     with connect() as conn:
         conn.executescript(SCHEMA)
+        # migrate pre-existing DBs (SCHEMA only covers fresh CREATEs)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(grades)")}
+        if "vision" not in cols:
+            conn.execute("ALTER TABLE grades ADD COLUMN vision TEXT")
 
 
 def _email_domain(email: str) -> str:
@@ -307,15 +314,18 @@ def record_send(conn, lead_id: int, kind: str):
 
 
 def record_grade(conn, lead_id: int, factors: list[int], overall: int,
-                 notes: str, sample_slug: str | None) -> int:
+                 notes: str, sample_slug: str | None,
+                 vision: str | None = None) -> int:
     """Store one manual grading pass. `factors` is the seven A-G scores in
-    order (see GRADE_FACTORS / GRADING-RUBRIC.md)."""
+    order (see GRADE_FACTORS / GRADING-RUBRIC.md). `vision` is the AI
+    pre-grade shown to the human at grading time ('ABCDEFG:overall'), kept
+    so insights can measure human-vs-AI agreement."""
     cols = ", ".join(GRADE_FACTORS)
     marks = ", ".join("?" * len(GRADE_FACTORS))
     cur = conn.execute(
-        f"INSERT INTO grades (lead_id, {cols}, overall, notes, sample_slug, created_at)"
-        f" VALUES (?, {marks}, ?, ?, ?, ?)",
-        (lead_id, *factors, overall, notes, sample_slug, now()),
+        f"INSERT INTO grades (lead_id, {cols}, overall, notes, sample_slug,"
+        f" vision, created_at) VALUES (?, {marks}, ?, ?, ?, ?, ?)",
+        (lead_id, *factors, overall, notes, sample_slug, vision, now()),
     )
     return cur.lastrowid
 

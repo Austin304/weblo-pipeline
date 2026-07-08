@@ -34,7 +34,8 @@ NICHE_BRIEFS = {
         type_pairing="Bold geometric sans (headings) + clean sans (body)",
         leading_section="Hero with giant click-to-call + '24/7 emergency' if applicable",
         primary_cta="Tap-to-call phone",
-        imagery="Trucks, crews at work, before/after"),
+        imagery="Trucks, crews at work, before/after",
+        stock_query="home service technician at work"),
     "outdoor": dict(
         match=("landscap", "lawn", "tree", "pool", "garden"),
         mood="Fresh, outdoorsy, capable",
@@ -42,7 +43,8 @@ NICHE_BRIEFS = {
         type_pairing="Friendly sans; slightly rounded",
         leading_section="Full-bleed photo hero of finished work",
         primary_cta="Get a free quote",
-        imagery="Lush finished projects, wide shots"),
+        imagery="Lush finished projects, wide shots",
+        stock_query="landscaped garden lawn"),
     "auto": dict(
         match=("auto", "car_repair", "detail", "body_shop", "tire", "mechanic"),
         mood="Rugged, dependable",
@@ -50,7 +52,8 @@ NICHE_BRIEFS = {
         type_pairing="Industrial/condensed headings + plain sans",
         leading_section="Hero + services grid",
         primary_cta="Book service / call",
-        imagery="Shop, cars, work in progress"),
+        imagery="Shop, cars, work in progress",
+        stock_query="auto repair shop mechanic"),
     "beauty": dict(
         match=("salon", "spa", "barber", "aesthet", "beauty", "nail", "med_spa",
                "medical_spa", "skin"),
@@ -59,7 +62,8 @@ NICHE_BRIEFS = {
         type_pairing="Serif display + light sans",
         leading_section="Imagery-forward hero, minimal text",
         primary_cta="Book appointment",
-        imagery="Interiors, results, clean product shots"),
+        imagery="Interiors, results, clean product shots",
+        stock_query="spa treatment room interior"),
     "food": dict(
         match=("restaurant", "cafe", "bakery", "bar", "pizza", "food", "coffee",
                "diner", "grill"),
@@ -68,7 +72,8 @@ NICHE_BRIEFS = {
         type_pairing="Characterful display + readable body",
         leading_section="Big food hero, then menu",
         primary_cta="View menu / order / reserve",
-        imagery="Food close-ups, interior ambiance"),
+        imagery="Food close-ups, interior ambiance",
+        stock_query="restaurant food interior"),
     "professional": dict(
         match=("law", "attorney", "account", "insurance", "financ", "tax",
                "bookkeep", "notary"),
@@ -77,7 +82,8 @@ NICHE_BRIEFS = {
         type_pairing="Classic serif or refined sans",
         leading_section="Hero with credibility line + credentials",
         primary_cta="Free consultation",
-        imagery="Office, headshots, city skyline"),
+        imagery="Office, headshots, city skyline",
+        stock_query="modern professional office"),
     "medical": dict(
         match=("dent", "orthodont", "medical", "chiro", "vet", "clinic",
                "physical_therap", "doctor", "wellness"),
@@ -86,7 +92,8 @@ NICHE_BRIEFS = {
         type_pairing="Rounded, approachable sans",
         leading_section="Hero + trust markers (insurance, new-patient)",
         primary_cta="Request appointment",
-        imagery="Clean office, friendly staff, patients"),
+        imagery="Clean office, friendly staff, patients",
+        stock_query="modern medical clinic"),
     "fitness": dict(
         match=("gym", "fitness", "yoga", "martial", "crossfit", "pilates",
                "studio"),
@@ -95,7 +102,8 @@ NICHE_BRIEFS = {
         type_pairing="Heavy condensed headings",
         leading_section="Bold motion-y hero",
         primary_cta="Start free trial / class",
-        imagery="Action shots, space, community"),
+        imagery="Action shots, space, community",
+        stock_query="gym fitness workout"),
     "contractor": dict(
         match=("contractor", "remodel", "handyman", "paint", "construction",
                "flooring", "kitchen", "bath"),
@@ -104,7 +112,8 @@ NICHE_BRIEFS = {
         type_pairing="Sturdy sans",
         leading_section="Before/after or portfolio-led hero",
         primary_cta="Get an estimate",
-        imagery="Project galleries, before/after"),
+        imagery="Project galleries, before/after",
+        stock_query="home renovation construction"),
     "service": dict(
         match=("clean", "moving", "pest", "junk", "storage", "laundry"),
         mood="Friendly, reliable, quick",
@@ -112,7 +121,8 @@ NICHE_BRIEFS = {
         type_pairing="Approachable sans",
         leading_section="Hero + simple 3-step 'how it works'",
         primary_cta="Get a quote / book",
-        imagery="Crews, results, happy-home shots"),
+        imagery="Crews, results, happy-home shots",
+        stock_query="professional home service"),
 }
 FALLBACK_BRIEF = dict(
     match=(),
@@ -121,7 +131,8 @@ FALLBACK_BRIEF = dict(
     type_pairing="Clean sans pairing",
     leading_section="Hero with clear value prop",
     primary_cta="Contact / call",
-    imagery="Best available real photo")
+    imagery="Best available real photo",
+    stock_query="modern small business")
 
 # --- Principle 3: layout archetypes ---------------------------------------
 ARCHETYPES = [
@@ -145,16 +156,19 @@ RUBRIC = """- Bespoke, not templated: looks designed for THIS business, and USES
 - Mobile: responsive, no horizontal scroll, tap targets big enough"""
 
 
-def niche_key(category: str) -> str:
-    cat = (category or "").lower()
-    for key, brief in NICHE_BRIEFS.items():
-        if any(m in cat for m in brief["match"]):
-            return key
+def niche_key(category: str, name: str = "") -> str:
+    # category first (authoritative when specific); the business NAME is the
+    # fallback for Places' generic types ("establishment", "point_of_interest")
+    # — e.g. category=establishment, name="Nursing Aesthetic Institute" → beauty
+    for text in ((category or "").lower(), (name or "").lower()):
+        for key, brief in NICHE_BRIEFS.items():
+            if any(m in text for m in brief["match"]):
+                return key
     return "fallback"
 
 
-def niche_brief(category: str) -> dict:
-    return NICHE_BRIEFS.get(niche_key(category), FALLBACK_BRIEF)
+def niche_brief(category: str, name: str = "") -> dict:
+    return NICHE_BRIEFS.get(niche_key(category, name), FALLBACK_BRIEF)
 
 
 def _style_context(key: str) -> str:
@@ -280,17 +294,18 @@ def site_images(website: str) -> list[str]:
         return []
 
 
-def stock_images(lead, brief: dict, limit: int = 3) -> list[str]:
+def stock_images(lead, brief: dict, limit: int = 8) -> list[str]:
     """Ladder step 3 — free niche stock (Pexels, then Unsplash). Both APIs are
-    $0; a clean stock photo beats a typographic hero every time. Returns []
+    $0; a clean stock photo beats a typographic hero every time. Returns
+    CANDIDATES (up to `limit`) — the generator picks the few that fit the
+    palette/mood, so more choices = better odds of an on-brand hero. Returns []
     when no key is configured or nothing landscape/large comes back."""
-    category = (lead["category"] or "").replace("_", " ").strip()
-    query = f"{category} {brief['imagery'].split(',')[0]}".strip() or "local business"
+    query = brief.get("stock_query") or "modern small business"
     if config.PEXELS_API_KEY:
         try:
             r = requests.get(
                 "https://api.pexels.com/v1/search",
-                params={"query": query, "per_page": 8,
+                params={"query": query, "per_page": 12,
                         "orientation": "landscape", "size": "large"},
                 headers={"Authorization": config.PEXELS_API_KEY}, timeout=15)
             if r.status_code == 200:
@@ -298,6 +313,10 @@ def stock_images(lead, brief: dict, limit: int = 3) -> list[str]:
                         if p.get("width", 0) >= 1200 and p.get("src", {}).get("large2x")]
                 if urls:
                     return urls[:limit]
+                log.warning("pexels: 0 usable results for %r", query)
+            else:
+                log.warning("pexels HTTP %s for %r: %s", r.status_code, query,
+                            r.text[:120])
         except requests.RequestException:
             log.warning("pexels search failed for %r", query)
     if config.UNSPLASH_ACCESS_KEY:
@@ -475,16 +494,22 @@ def _call_claude(conn, system: str, user, lead_id: int,
 
 def build_prompt(lead, brief: dict, archetype: str, images: list[str],
                  profile: dict, brand: dict, image_source: str = "") -> str:
-    image_block = "\n".join(
-        f"  {i+1}. {url}  (role: {'hero' if i == 0 else 'supporting'})"
-        for i, url in enumerate(images)
-    ) or ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
-          "gradient background. Never use a broken <img> or an invented URL.")
     if images and image_source == "stock":
+        image_block = "\n".join(f"  {i+1}. {url}" for i, url in enumerate(images))
         image_block += (
+            "\n  These are stock CANDIDATES — CHOOSE the 1-3 whose lighting, tones and "
+            "subject genuinely fit the palette/mood above and use ONLY those (the single "
+            "best one as hero). SKIP any that look cluttered, garish, cheap, or off-palette "
+            "— a page with one perfect photo beats a page with three mediocre ones."
             "\n  NOTE: these are licensed stock photos matching their industry — NOT "
             "this business's own premises/staff/work. Use them as atmosphere; never "
             "caption or imply they depict this specific business.")
+    else:
+        image_block = "\n".join(
+            f"  {i+1}. {url}  (role: {'hero' if i == 0 else 'supporting'})"
+            for i, url in enumerate(images)
+        ) or ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
+              "gradient background. Never use a broken <img> or an invented URL.")
     if brand:
         parts = []
         if brand.get("logo"):
@@ -556,6 +581,12 @@ generic and templated. Star ratings and review counts belong in the testimonials
 section further down, never as a hero badge. The headline MUST scale responsively
 (use CSS clamp() for its font-size) and wrap cleanly — never a fixed size that
 overflows, clips, collides with the CTA, or "smooshes" on a phone-width screen.
+TEXT OVER PHOTOS: any text sitting on a photo MUST have a dark scrim or gradient
+overlay behind it (e.g. a rgba(0,0,0,.35–.55) layer or bottom-up gradient) so every
+word reads clearly — light text straight onto a busy or bright photo is a failure.
+HEADER AT PHONE WIDTH: at 390px the logo/site name, location line, and any header
+CTA must never overlap, collide, or clip — shrink type, wrap, or drop the CTA to
+its own row. A broken mobile header kills the whole pitch.
 CRAFT (avoid "basic"): make it feel premium and designed, not a plain vertical stack of
 centered text blocks. Use generous whitespace, a clear type scale (large confident
 headings, comfortable body), real visual variety between sections (alternating layouts,
@@ -582,6 +613,11 @@ spots destroys all trust in the pitch, so treat this as harder than any design r
 - Testimonials: quote ONLY from quotable_reviews_4_5_star_only below. Light cleanup
   only — never append, embellish, or invent words the reviewer did not write, and
   never stitch a quote from more than one review.
+- Shortening a quote: use ONE contiguous excerpt, trimming only whole sentences from
+  the start or end — never delete words or sentences from the middle. NEVER trim away
+  context that changes who the reviewer appears to be (e.g. a fellow professional or
+  trainee reading as a patient). If a review can't be excerpted honestly, quote it in
+  full or use a different one.
 - Days / hours: the business is open EXACTLY {open_days} day(s) per week. If you state
   a "days per week" figure, use that number verbatim; render the hours exactly as
   listed. Do NOT count or infer your own day total.
@@ -595,18 +631,26 @@ Return only the HTML, nothing else."""
 CRITIQUE_KEYS = ("bespoke", "hero", "craft", "real", "imagery", "beats", "mobile")
 
 
-def critique(conn, lead, html: str) -> tuple[bool, str, bool]:
+def critique(conn, lead, html: str, image_source: str = "") -> tuple[bool, str, bool]:
     """Pass 2 text-only self-critique against the rubric (Principle 6, Phase B).
 
     Returns (passed, fixes, weak). `weak` means it passed but some core factor
     scored a 4 — "fine, forgettable" territory — so one polish pass is worth it."""
+    imagery_note = ""
+    if image_source == "typographic":
+        imagery_note = (
+            "\nIMAGE CONSTRAINT: NO photographs exist for this business (no real "
+            "photos, no usable stock) and the generator is FORBIDDEN to invent "
+            "image URLs. The page is intentionally typographic. Do NOT demand "
+            "real photos — score 'imagery' on the craft of the typographic/"
+            "graphic treatment instead.")
     prompt = f"""Review this generated sample website HTML against the rubric. Be harsh.
 
 RUBRIC (score each 1-5):
 {RUBRIC}
 
 THE BUSINESS: {lead['business_name']} ({lead['category']})
-THE WEAKNESS THIS MUST FIX: {lead['qualify_reason'] or 'no web presence'}
+THE WEAKNESS THIS MUST FIX: {lead['qualify_reason'] or 'no web presence'}{imagery_note}
 
 Return STRICT JSON only, scoring EXACTLY these keys:
 {{"verdict": "PASS" or "FAIL", "scores": {{"bespoke": n, "hero": n, "craft": n, "real": n, "imagery": n, "beats": n, "mobile": n}}, "fixes": ["specific fix", ...]}}
@@ -675,6 +719,11 @@ insurance, financing); credentials or certifications; superlatives/rankings ("be
 "#1", "award-winning", "top-rated") not in the data; a stated days-per-week other than
 {facts['open_days_per_week']}; testimonial quotes that are not from a 4-5 star review or
 that add/alter words the reviewer wrote.
+Testimonial excerpting rule: a quote MAY be a shortened contiguous excerpt of a real
+review with whole sentences trimmed from the start or end — do NOT flag that. FLAG a
+quote only if it adds/changes words, deletes words or sentences from the MIDDLE,
+stitches multiple reviews, or trims context that changes who the reviewer appears to
+be (e.g. a fellow professional or trainee reading as a patient).
 Do NOT flag generic benefit/marketing language that asserts no specific fact (e.g.
 "results that look like you"). Be precise and conservative — only genuine unsupported
 factual claims.
@@ -756,7 +805,7 @@ def extract_html(raw: str) -> str:
 
 def build_one(conn, lead) -> bool:
     profile = json.loads(lead["source_profile"] or "{}")
-    brief = niche_brief(lead["category"])
+    brief = niche_brief(lead["category"], lead["business_name"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
     images, image_source = select_images(conn, lead, profile, brief)
     brand = extract_brand(lead["existing_website"]) if lead["existing_website"] else {}
@@ -774,7 +823,7 @@ def build_one(conn, lead) -> bool:
     ])
 
     system = "You are an expert web designer."
-    style_ctx = _style_context(niche_key(lead["category"]))
+    style_ctx = _style_context(niche_key(lead["category"], lead["business_name"]))
     if style_ctx:
         system += "\n\n" + style_ctx
 
@@ -794,7 +843,10 @@ def build_one(conn, lead) -> bool:
         if failure:
             log.info("lead %s attempt %s failed gate: %s", lead["id"], attempt, failure)
             feedback.append(
-                f"PREVIOUS ATTEMPT FAILED THE QUALITY GATE: {failure}. Fix that.")
+                f"PREVIOUS ATTEMPT FAILED THE QUALITY GATE: {failure}. Fix that — and "
+                "regenerate the COMPLETE page with ALL required sections (hero, "
+                "services, why-choose-us, testimonials, hours/location, contact CTA) "
+                "and the images; fix only what's named, never drop anything else.")
             continue
         # grounding fact-check — reject any invented claim before design polish
         fact_ok, fact_fixes = fact_check(conn, lead, profile, candidate)
@@ -804,7 +856,9 @@ def build_one(conn, lead) -> bool:
             feedback.append(
                 "FACT-CHECK — these claims are NOT supported by the business's "
                 "real data. Remove or rewrite each so the page states only "
-                "verified facts:\n" + fact_fixes)
+                "verified facts:\n" + fact_fixes +
+                "\nRegenerate the COMPLETE page with ALL required sections and "
+                "the images — change only the flagged claims, drop nothing else.")
             html = candidate  # fallback if later attempts regress
             continue
         # one critique-driven refine per lead: on FAIL it's mandatory, and a
@@ -812,13 +866,15 @@ def build_one(conn, lead) -> bool:
         # single polish pass — the cached base prompt makes the retry cheap
         if not critiqued and attempt < MAX_ATTEMPTS:
             critiqued = True
-            ok, fixes, weak = critique(conn, lead, candidate)
+            ok, fixes, weak = critique(conn, lead, candidate, image_source)
             if fixes and (not ok or weak):
                 log.info("lead %s critique (%s): %s", lead["id"],
                          "FAIL" if not ok else "PASS-but-weak", fixes[:200])
                 feedback.append(
                     "A design review of your previous attempt required these "
-                    "fixes — apply them all:\n" + fixes)
+                    "fixes — apply them all:\n" + fixes +
+                    "\nRegenerate the COMPLETE page with ALL required sections and "
+                    "the images — apply the fixes, drop nothing else.")
                 html = candidate  # keep as fallback if the refine pass regresses
                 continue
         html = candidate
