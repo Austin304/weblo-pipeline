@@ -26,6 +26,11 @@ EST_GEN_USD = 0.45        # worst-case pre-call estimate (doc 08: estimate from 
 FACT_CHECK_USD = 0.03     # cheap Haiku grounding pass; real cost ~0.005
 PHOTO_VISION_USD = 0.02   # cheap Haiku-vision candidate ranking; real cost ~0.01
 
+# where the main subject sits -> the CSS object-position that keeps it in frame
+# after an object-fit:cover crop (the #1 cause of "photo cropped through a face")
+FOCUS_CSS = {"top": "center top", "bottom": "center bottom",
+             "left": "left center", "right": "right center", "center": "center"}
+
 
 def _as_int(v, default: int = 0) -> int:
     try:
@@ -392,7 +397,9 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         "HERO background of a PREMIUM website: high-quality, well-composed, appealing "
         "and uncluttered at full width. A clinical close-up, a logo, a screenshot, a "
         "dim/cluttered/garish snapshot, or an awkward crop is a POOR hero (it may still "
-        "be usable small inside a section)."}]
+        "be usable small inside a section). Also note WHERE the main subject sits in the "
+        "frame, so a CSS crop can be aimed to keep it (a wide hero crops off top and "
+        "bottom; a tall column crops off the sides)."}]
     for i, url in enumerate(urls):
         content.append({"type": "text", "text": f"Image {i+1}:"})
         content.append({"type": "image", "source": {"type": "url", "url": url}})
@@ -400,7 +407,8 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         "Return STRICT JSON only:\n"
         '{"images": [{"n": 1, "desc": "<=12 words: subject + quality", '
         '"hero": <1-5 hero suitability>, "use": true|false (does it belong on the '
-        'page at all?)}, ...]}'})
+        'page at all?), "focus": "top|center|bottom|left|right (where the main '
+        'subject/face sits, so a crop keeps it in frame)"}, ...]}'})
     try:
         client = _claude()
         resp = client.messages.create(
@@ -425,10 +433,12 @@ def describe_and_rank_images(conn, lead, urls: list[str],
     for item in data.get("images") or []:
         n = _as_int(item.get("n"))
         if 1 <= n <= len(urls):
+            foc = str(item.get("focus") or "center").lower()
             notes[urls[n - 1]] = {
                 "desc": str(item.get("desc") or "")[:120],
                 "hero": _as_int(item.get("hero")),
                 "use": bool(item.get("use", True)),
+                "focus": foc if foc in FOCUS_CSS else "center",
             }
     if not notes:
         return urls, {}
@@ -587,13 +597,17 @@ def _render_image_block(images: list[str], image_source: str,
         nt = notes.get(url, {})
         desc = f" — {nt['desc']}" if nt.get("desc") else ""
         avoid = " [LOW QUALITY — use small or omit]" if nt and not nt.get("use", True) else ""
+        # aim the crop: the vision model saw where the subject is
+        foc = nt.get("focus")
+        pos = (f" — subject at {foc}; set object-position: {FOCUS_CSS[foc]}"
+               if foc and foc != "center" and foc in FOCUS_CSS else "")
         if image_source == "stock":
             fit = f" [hero-fit {nt['hero']}/5]" if nt.get("hero") else ""
-            lines.append(f"  {i+1}. {url}{fit}{avoid}{desc}")
+            lines.append(f"  {i+1}. {url}{fit}{avoid}{desc}{pos}")
         else:
             role = "hero" if i == 0 else "supporting"
             fit = f", hero-fit {nt['hero']}/5" if nt.get("hero") else ""
-            lines.append(f"  {i+1}. {url}  (role: {role}{fit}){avoid}{desc}")
+            lines.append(f"  {i+1}. {url}  (role: {role}{fit}){avoid}{desc}{pos}")
     block = "\n".join(lines)
     if image_source == "stock":
         block += (
@@ -699,6 +713,18 @@ word reads clearly — light text straight onto a busy or bright photo is a fail
 HEADER AT PHONE WIDTH: at 390px the logo/site name, location line, and any header
 CTA must never overlap, collide, or clip — shrink type, wrap, or drop the CTA to
 its own row. A broken mobile header kills the whole pitch.
+IMAGE CROPPING & PLACEMENT (this is where samples usually fail — the photos are
+fine, the framing is not): give every content <img> a defined box (an
+aspect-ratio or a height) and ALWAYS set object-fit: cover so it fills the box
+without stretching or squishing — never let a photo distort or letterbox. Aim the
+crop with object-position: when a photo lists a "subject at ..." hint above, use
+the object-position it gives so the face/subject is never sliced off; otherwise
+default object-position: center. Match photo shape to slot — a wide landscape
+belongs in a full-bleed band or hero, a portrait belongs in a tall column or a
+side-by-side split, not stretched across a wide hero. The hero image must be
+LARGE and immersive (a tall band or full-bleed section, not a thin strip), and on
+mobile it must keep a sensible height and its subject in frame. In grids, give
+every image the SAME aspect-ratio so the row stays even.
 CRAFT (avoid "basic"): make it feel premium and designed, not a plain vertical stack of
 centered text blocks. Use generous whitespace, a clear type scale (large confident
 headings, comfortable body), real visual variety between sections (alternating layouts,
