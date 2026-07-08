@@ -24,6 +24,14 @@ MAX_ATTEMPTS = 3          # total generation attempts (doc 01 STEP 2/3)
 GEN_MAX_TOKENS = 16000
 EST_GEN_USD = 0.45        # worst-case pre-call estimate (doc 08: estimate from max_tokens)
 FACT_CHECK_USD = 0.03     # cheap Haiku grounding pass; real cost ~0.005
+PHOTO_VISION_USD = 0.02   # cheap Haiku-vision candidate ranking; real cost ~0.01
+
+
+def _as_int(v, default: int = 0) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 # --- Principle 2: per-niche art direction ---------------------------------
 NICHE_BRIEFS = {
@@ -359,6 +367,78 @@ def select_images(conn, lead, profile: dict, brief: dict) -> tuple[list[str], st
     return [], "typographic"
 
 
+def describe_and_rank_images(conn, lead, urls: list[str],
+                             image_source: str) -> tuple[list[str], dict]:
+    """Haiku-vision pre-pass. The generator picks photos from URLs it cannot SEE,
+    so it once made a clinical gloved-hand close-up the hero. Show the candidates
+    to a cheap vision model, get a one-line description + hero-suitability (1-5)
+    per image, reorder best-hero-first, and hand the descriptions to the generator
+    so it chooses eyes-open (see build_prompt / _render_image_block).
+
+    Returns (reordered_urls, {url: {"desc","hero","use"}}). Degrades to
+    (urls, {}) on any failure or when there's nothing to rank — this is an
+    enhancement, never a gate; a build must never fail because of it."""
+    if len(urls) < 2:
+        return urls, {}
+    if costs.check(conn, "claude", PHOTO_VISION_USD) == "block":
+        log.warning("claude budget blocked; photo vision rank skipped")
+        return urls, {}
+    kind = ("licensed stock photos for this industry (NOT the business's own "
+            "premises/staff)" if image_source == "stock"
+            else "photos associated with this specific business")
+    content = [{"type": "text", "text":
+        f"These are candidate images for a {lead['category'] or 'local business'} "
+        f"website ({kind}). For EACH image, judge how well it would work as the large "
+        "HERO background of a PREMIUM website: high-quality, well-composed, appealing "
+        "and uncluttered at full width. A clinical close-up, a logo, a screenshot, a "
+        "dim/cluttered/garish snapshot, or an awkward crop is a POOR hero (it may still "
+        "be usable small inside a section)."}]
+    for i, url in enumerate(urls):
+        content.append({"type": "text", "text": f"Image {i+1}:"})
+        content.append({"type": "image", "source": {"type": "url", "url": url}})
+    content.append({"type": "text", "text":
+        "Return STRICT JSON only:\n"
+        '{"images": [{"n": 1, "desc": "<=12 words: subject + quality", '
+        '"hero": <1-5 hero suitability>, "use": true|false (does it belong on the '
+        'page at all?)}, ...]}'})
+    try:
+        client = _claude()
+        resp = client.messages.create(
+            model=config.MODEL_CLASSIFIER, max_tokens=500,
+            system="You are a photo editor for premium web design. Be blunt about quality.",
+            messages=[{"role": "user", "content": content}],
+        )
+        costs.record(conn, "claude", "photo_vision_rank",
+                     costs.claude_cost(config.MODEL_CLASSIFIER,
+                                       resp.usage.input_tokens, resp.usage.output_tokens),
+                     lead_id=lead["id"], tokens_in=resp.usage.input_tokens,
+                     tokens_out=resp.usage.output_tokens)
+        conn.commit()
+        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+    except (AttributeError, json.JSONDecodeError):
+        log.warning("photo vision rank unparseable; keeping original order")
+        return urls, {}
+    except Exception:
+        log.exception("photo vision rank failed; keeping original order")
+        return urls, {}
+    notes = {}
+    for item in data.get("images") or []:
+        n = _as_int(item.get("n"))
+        if 1 <= n <= len(urls):
+            notes[urls[n - 1]] = {
+                "desc": str(item.get("desc") or "")[:120],
+                "hero": _as_int(item.get("hero")),
+                "use": bool(item.get("use", True)),
+            }
+    if not notes:
+        return urls, {}
+    # best hero first; sorted() is stable so equal scores keep their prior order
+    ordered = sorted(urls, key=lambda u: -(notes.get(u, {}).get("hero") or 0))
+    log.info("lead %s photo rank: %s", lead["id"],
+             [(notes[u]["hero"], notes[u]["desc"]) for u in ordered if u in notes])
+    return ordered, notes
+
+
 def _norm_hex(h: str) -> str:
     h = h.lower().lstrip("#")
     if len(h) == 3:
@@ -492,11 +572,31 @@ def _call_claude(conn, system: str, user, lead_id: int,
     return resp.content[0].text
 
 
-def build_prompt(lead, brief: dict, archetype: str, images: list[str],
-                 profile: dict, brand: dict, image_source: str = "") -> str:
-    if images and image_source == "stock":
-        image_block = "\n".join(f"  {i+1}. {url}" for i, url in enumerate(images))
-        image_block += (
+def _render_image_block(images: list[str], image_source: str,
+                        image_notes: dict | None = None) -> str:
+    """The IMAGES section of the gen prompt. When `image_notes` is present (from
+    describe_and_rank_images), each URL carries the vision model's one-line
+    description + hero-fit, so the generator picks eyes-open instead of guessing
+    from a URL it can't see."""
+    if not images:
+        return ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
+                "gradient background. Never use a broken <img> or an invented URL.")
+    notes = image_notes or {}
+    lines = []
+    for i, url in enumerate(images):
+        nt = notes.get(url, {})
+        desc = f" — {nt['desc']}" if nt.get("desc") else ""
+        avoid = " [LOW QUALITY — use small or omit]" if nt and not nt.get("use", True) else ""
+        if image_source == "stock":
+            fit = f" [hero-fit {nt['hero']}/5]" if nt.get("hero") else ""
+            lines.append(f"  {i+1}. {url}{fit}{avoid}{desc}")
+        else:
+            role = "hero" if i == 0 else "supporting"
+            fit = f", hero-fit {nt['hero']}/5" if nt.get("hero") else ""
+            lines.append(f"  {i+1}. {url}  (role: {role}{fit}){avoid}{desc}")
+    block = "\n".join(lines)
+    if image_source == "stock":
+        block += (
             "\n  These are stock CANDIDATES — CHOOSE the 1-3 whose lighting, tones and "
             "subject genuinely fit the palette/mood above and use ONLY those (the single "
             "best one as hero). SKIP any that look cluttered, garish, cheap, or off-palette "
@@ -504,12 +604,24 @@ def build_prompt(lead, brief: dict, archetype: str, images: list[str],
             "\n  NOTE: these are licensed stock photos matching their industry — NOT "
             "this business's own premises/staff/work. Use them as atmosphere; never "
             "caption or imply they depict this specific business.")
-    else:
-        image_block = "\n".join(
-            f"  {i+1}. {url}  (role: {'hero' if i == 0 else 'supporting'})"
-            for i, url in enumerate(images)
-        ) or ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
-              "gradient background. Never use a broken <img> or an invented URL.")
+    if notes:
+        block += (
+            "\n  The descriptions and hero-fit scores above were written by a vision model "
+            "that SAW these images — you cannot. TRUST them: lead with the highest hero-fit "
+            "image, keep low hero-fit or LOW QUALITY images out of the hero (use them small "
+            "in a supporting section, or omit them entirely).")
+        if max((notes.get(u, {}).get("hero") or 0) for u in images) <= 2:
+            block += (
+                "\n  NONE of these is a strong hero (all hero-fit <=2). Use a confident "
+                "TYPOGRAPHIC / brand-driven hero instead and place the best photo lower on "
+                "the page — do NOT force a weak photo into the hero.")
+    return block
+
+
+def build_prompt(lead, brief: dict, archetype: str, images: list[str],
+                 profile: dict, brand: dict, image_source: str = "",
+                 image_notes: dict | None = None) -> str:
+    image_block = _render_image_block(images, image_source, image_notes)
     if brand:
         parts = []
         if brand.get("logo"):
@@ -808,6 +920,9 @@ def build_one(conn, lead) -> bool:
     brief = niche_brief(lead["category"], lead["business_name"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
     images, image_source = select_images(conn, lead, profile, brief)
+    # vision pre-pass: reorder best-hero-first + describe each so the generator
+    # (which can't see the URLs) chooses eyes-open. No-op if <2 images.
+    images, image_notes = describe_and_rank_images(conn, lead, images, image_source)
     brand = extract_brand(lead["existing_website"]) if lead["existing_website"] else {}
     if brand:
         log.info("lead %s brand: colors=%s fonts=%s logo=%s", lead["id"],
@@ -828,7 +943,7 @@ def build_one(conn, lead) -> bool:
         system += "\n\n" + style_ctx
 
     base_prompt = build_prompt(lead, brief, archetype, images, profile, brand,
-                               image_source)
+                               image_source, image_notes)
     feedback: list[str] = []
     html, failure = None, "no attempts made"
     critiqued = False
