@@ -36,6 +36,22 @@ so the AI self-critique starts catching it before a human ever sees it. The goal
 is for `grade_averages` to climb across the first 30 and for the machine critique
 to converge with the human grades.
 
+Three tools close the loop mechanically (see `exemplars/README.md`):
+
+```bash
+run.py vision 18 22 31    # laptop: Playwright screenshots + Opus VISION grade
+                          # per sample; prints a suggested grade command to
+                          # edit and paste (your judgment stays authoritative)
+run.py insights           # factor averages by niche / image source / archetype
+                          # + every CHANGE/KEEP note, worst-graded first
+run.py exemplar 18        # distill a sample you graded 5s into a style crib
+                          # injected into every future generation for its niche
+```
+
+After each grading round: run `insights`, fold recurring CHANGE-FIRST notes
+into `exemplars/LESSONS.md` (hand-curated), and `exemplar` your best sample
+per niche.
+
 ## Logging a grade
 
 One command per graded sample (records the grade against the exact build that

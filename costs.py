@@ -26,9 +26,12 @@ _BUDGETS = {
 }
 
 
-def claude_cost(model: str, tokens_in: int, tokens_out: int) -> float:
+def claude_cost(model: str, tokens_in: int, tokens_out: int,
+                cache_write: int = 0, cache_read: int = 0) -> float:
+    """Cache-aware: writes bill at 1.25x input rate, reads at 0.1x."""
     in_rate, out_rate = CLAUDE_PRICES.get(model, (5.00, 25.00))
-    return tokens_in / 1e6 * in_rate + tokens_out / 1e6 * out_rate
+    return ((tokens_in + cache_write * 1.25 + cache_read * 0.10) / 1e6 * in_rate
+            + tokens_out / 1e6 * out_rate)
 
 
 def month_to_date(conn, service: str | None = None) -> float:

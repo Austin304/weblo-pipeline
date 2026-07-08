@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 3          # total generation attempts (doc 01 STEP 2/3)
 GEN_MAX_TOKENS = 16000
 EST_GEN_USD = 0.45        # worst-case pre-call estimate (doc 08: estimate from max_tokens)
+FACT_CHECK_USD = 0.03     # cheap Haiku grounding pass; real cost ~0.005
 
 # --- Principle 2: per-niche art direction ---------------------------------
 NICHE_BRIEFS = {
@@ -144,12 +145,40 @@ RUBRIC = """- Bespoke, not templated: looks designed for THIS business, and USES
 - Mobile: responsive, no horizontal scroll, tap targets big enough"""
 
 
-def niche_brief(category: str) -> dict:
+def niche_key(category: str) -> str:
     cat = (category or "").lower()
-    for brief in NICHE_BRIEFS.values():
+    for key, brief in NICHE_BRIEFS.items():
         if any(m in cat for m in brief["match"]):
-            return brief
-    return FALLBACK_BRIEF
+            return key
+    return "fallback"
+
+
+def niche_brief(category: str) -> dict:
+    return NICHE_BRIEFS.get(niche_key(category), FALLBACK_BRIEF)
+
+
+def _style_context(key: str) -> str:
+    """Feedback-loop text injected into the generator's system prompt:
+    a distilled style crib from a top-graded sample of this niche
+    (exemplars/<niche>.md, written by `run.py exemplar <id>`) plus curated
+    lessons from hand-grading (exemplars/LESSONS.md). Both optional; the
+    system prompt is cached, so across a same-niche batch this text is
+    read at ~10% of the input price."""
+    parts = []
+    crib = config.EXEMPLARS_DIR / f"{key}.md"
+    if crib.is_file():
+        parts.append(
+            "STYLE EXEMPLAR — distilled from a previously TOP-GRADED sample for "
+            "another business in this niche. Match this LEVEL of craft and these "
+            "techniques; never copy its content, facts, or brand colors:\n"
+            + crib.read_text(encoding="utf-8").strip())
+    lessons = config.EXEMPLARS_DIR / "LESSONS.md"
+    if lessons.is_file():
+        parts.append(
+            "LESSONS FROM HAND-GRADED SAMPLES — recurring flaws and wins from "
+            "human review of past output. Apply every relevant one:\n"
+            + lessons.read_text(encoding="utf-8").strip())
+    return "\n\n".join(parts)
 
 
 def slugify(lead) -> str:
@@ -177,6 +206,31 @@ def unique_slug(conn, lead) -> str:
 
 
 # --- Principle 1: image ladder --------------------------------------------
+
+def _photo_rank(p: dict) -> int:
+    """Lower = better HERO candidate. Landscape and wide wins; portrait and
+    near-square (usually a logo or profile shot) sink to the bottom."""
+    w, h = p.get("w") or 0, p.get("h") or 0
+    if not w or not h:
+        return 2  # legacy lead with no stored dims — keep, but after known-good
+    if abs(w - h) <= min(w, h) * 0.12:
+        return 4  # near-square: logo-shaped, never lead with it
+    if h > w:
+        return 3  # portrait: poor hero crop
+    return 0 if w >= 1200 else 1
+
+
+def rank_photos(profile: dict) -> list[dict]:
+    """Normalize both profile shapes (legacy `photo_names` strings, new
+    `photos` dicts with w/h) into hero-first order, dropping under-sized ones."""
+    raw = profile.get("photos")
+    if raw is None:
+        raw = [{"ref": r} for r in profile.get("photo_names", [])]
+    good = [p for p in raw if p.get("ref")
+            and (not (p.get("w") or p.get("h"))
+                 or max(p.get("w") or 0, p.get("h") or 0) >= 800)]
+    return sorted(good, key=_photo_rank)
+
 
 def places_photo_urls(conn, photo_refs: list[str], limit: int = 4) -> list[str]:
     """Resolve legacy photo references to public lh3 URIs.
@@ -226,16 +280,63 @@ def site_images(website: str) -> list[str]:
         return []
 
 
-def select_images(conn, lead, profile: dict) -> tuple[list[str], str]:
+def stock_images(lead, brief: dict, limit: int = 3) -> list[str]:
+    """Ladder step 3 — free niche stock (Pexels, then Unsplash). Both APIs are
+    $0; a clean stock photo beats a typographic hero every time. Returns []
+    when no key is configured or nothing landscape/large comes back."""
+    category = (lead["category"] or "").replace("_", " ").strip()
+    query = f"{category} {brief['imagery'].split(',')[0]}".strip() or "local business"
+    if config.PEXELS_API_KEY:
+        try:
+            r = requests.get(
+                "https://api.pexels.com/v1/search",
+                params={"query": query, "per_page": 8,
+                        "orientation": "landscape", "size": "large"},
+                headers={"Authorization": config.PEXELS_API_KEY}, timeout=15)
+            if r.status_code == 200:
+                urls = [p["src"]["large2x"] for p in r.json().get("photos", [])
+                        if p.get("width", 0) >= 1200 and p.get("src", {}).get("large2x")]
+                if urls:
+                    return urls[:limit]
+        except requests.RequestException:
+            log.warning("pexels search failed for %r", query)
+    if config.UNSPLASH_ACCESS_KEY:
+        try:
+            r = requests.get(
+                "https://api.unsplash.com/search/photos",
+                params={"query": query, "per_page": 8, "orientation": "landscape",
+                        "client_id": config.UNSPLASH_ACCESS_KEY}, timeout=15)
+            if r.status_code == 200:
+                urls = [p["urls"]["regular"] for p in r.json().get("results", [])
+                        if p.get("urls", {}).get("regular")]
+                if urls:
+                    return urls[:limit]
+        except requests.RequestException:
+            log.warning("unsplash search failed for %r", query)
+    return []
+
+
+def select_images(conn, lead, profile: dict, brief: dict) -> tuple[list[str], str]:
     """Image source ladder; returns (urls, image_source)."""
-    photos = places_photo_urls(conn, profile.get("photo_names", []))
-    if photos:
-        return photos, "places"
+    ranked = rank_photos(profile)
+    # never LEAD with a logo-shaped/portrait photo — if that's all they have,
+    # prefer clean stock for the hero (doc: "clean stock beats a real ugly one")
+    hero_worthy = [p for p in ranked if _photo_rank(p) <= 2]
+    if hero_worthy:
+        photos = places_photo_urls(conn, [p["ref"] for p in ranked])
+        if photos:
+            return photos, "places"
     if lead["qualify_status"] == "OUTDATED":
         imgs = site_images(lead["existing_website"])
         if imgs:
             return imgs, "their_site"
-    # No stock API keys configured -> typographic hero is the honest last resort
+    stock = stock_images(lead, brief)
+    if stock:
+        return stock, "stock"
+    if ranked:  # only non-hero-worthy real photos exist; still beat a gradient
+        photos = places_photo_urls(conn, [p["ref"] for p in ranked])
+        if photos:
+            return photos, "places"
     return [], "typographic"
 
 
@@ -336,22 +437,36 @@ def _claude():
     return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
-def _call_claude(conn, system: str, user: str, lead_id: int,
+def _call_claude(conn, system: str, user, lead_id: int,
                  operation: str) -> str | None:
+    """`user` is a string, or (base_prompt, feedback_str) — the base prompt gets a
+    cache breakpoint so gate/critique retries re-read it at ~10% of input price
+    (the retry always lands well inside the 5-min cache TTL)."""
     if costs.check(conn, "claude", EST_GEN_USD) == "block":
         log.warning("claude budget blocked; %s skipped", operation)
         return None
+    if isinstance(user, tuple):
+        base, feedback = user
+        content = [{"type": "text", "text": base,
+                    "cache_control": {"type": "ephemeral"}}]
+        if feedback:
+            content.append({"type": "text", "text": feedback})
+    else:
+        content = user
     client = _claude()
     resp = client.messages.create(
         model=config.MODEL_QUALITY,
         max_tokens=GEN_MAX_TOKENS,
-        system=system,
-        messages=[{"role": "user", "content": user}],
+        system=[{"type": "text", "text": system,
+                 "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": content}],
     )
     usage = resp.usage
     costs.record(conn, "claude", operation,
                  costs.claude_cost(config.MODEL_QUALITY, usage.input_tokens,
-                                   usage.output_tokens),
+                                   usage.output_tokens,
+                                   cache_write=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                                   cache_read=getattr(usage, "cache_read_input_tokens", 0) or 0),
                  lead_id=lead_id, tokens_in=usage.input_tokens,
                  tokens_out=usage.output_tokens)
     conn.commit()
@@ -359,12 +474,17 @@ def _call_claude(conn, system: str, user: str, lead_id: int,
 
 
 def build_prompt(lead, brief: dict, archetype: str, images: list[str],
-                 profile: dict, brand: dict) -> str:
+                 profile: dict, brand: dict, image_source: str = "") -> str:
     image_block = "\n".join(
         f"  {i+1}. {url}  (role: {'hero' if i == 0 else 'supporting'})"
         for i, url in enumerate(images)
     ) or ("  none available — use a strong TYPOGRAPHIC hero on a solid or subtle "
           "gradient background. Never use a broken <img> or an invented URL.")
+    if images and image_source == "stock":
+        image_block += (
+            "\n  NOTE: these are licensed stock photos matching their industry — NOT "
+            "this business's own premises/staff/work. Use them as atmosphere; never "
+            "caption or imply they depict this specific business.")
     if brand:
         parts = []
         if brand.get("logo"):
@@ -395,12 +515,20 @@ def build_prompt(lead, brief: dict, archetype: str, images: list[str],
             "ESTABLISH THEIR PRESENCE: they have no real website today. This is their first "
             "real web presence — make it genuinely impressive and credible, the kind of site "
             "that makes this business look established and trustworthy at a glance.")
+    hours = profile.get("hours") or []
+    open_days = sum(1 for h in hours if "closed" not in h.lower())
+    # Only 4-5★ reviews may be quoted — never launder a positive fragment out of a
+    # negative review (that misrepresents an unhappy customer and reads as dishonest
+    # to an owner who knows their own reviews).
+    quotable = [r for r in (profile.get("reviews") or [])
+                if (r.get("rating") or 0) >= 4 and r.get("text")]
     business = {
         "name": lead["business_name"], "category": lead["category"],
         "phone": lead["phone"], "address": lead["address"],
         "rating": lead["rating"], "review_count": lead["review_count"],
-        "hours": profile.get("hours"), "summary": profile.get("summary"),
-        "reviews": profile.get("reviews"),
+        "hours": hours, "open_days_per_week": open_days,
+        "summary": profile.get("summary"),
+        "quotable_reviews_4_5_star_only": quotable,
     }
     return f"""You are an expert web designer creating a sample site to win this local business as a client.
 Generate ONE complete, single-file, responsive HTML page (inline CSS, minimal/no JS), mobile-first.
@@ -425,7 +553,9 @@ marketing HEADLINE — a benefit or hook written for THIS business — set over 
 hero image, with the primary CTA nearby. Do NOT open with an "app-store card": a
 stacked business name + one-line description + a star-rating badge. That layout reads
 generic and templated. Star ratings and review counts belong in the testimonials
-section further down, never as a hero badge.
+section further down, never as a hero badge. The headline MUST scale responsively
+(use CSS clamp() for its font-size) and wrap cleanly — never a fixed size that
+overflows, clips, collides with the CTA, or "smooshes" on a phone-width screen.
 CRAFT (avoid "basic"): make it feel premium and designed, not a plain vertical stack of
 centered text blocks. Use generous whitespace, a clear type scale (large confident
 headings, comfortable body), real visual variety between sections (alternating layouts,
@@ -433,13 +563,28 @@ an image band, a stats or services grid), and thoughtful detail. Aim for "a desi
 made this for me," not "a competent template."
 
 Required sections: a hero (per HERO above), services, why-choose-us,
-testimonials pulled ONLY from the provided real reviews (lightly cleaned, attributed
+testimonials pulled ONLY from the provided 4-5★ reviews (lightly cleaned, attributed
 "— Google review"), hours/location, and a clear contact CTA using their real phone/address.
 Include <meta name="viewport">. Semantic HTML, alt text, sufficient contrast.
 No lorem ipsum. No placeholder text. No fixed widths wider than the viewport.
 A tiny tasteful footer line "Sample design" is acceptable; never plaster SAMPLE across the page.
 
-Use ONLY the real details below — never invent services, awards, or testimonials.
+STRICT HONESTY — this is what wins or loses the client. One invented fact the owner
+spots destroys all trust in the pitch, so treat this as harder than any design rule:
+- State ONLY facts present in the BUSINESS PROFILE below. If a section needs more
+  words, use benefit/experience language that asserts NO new fact — never fill a gap
+  with a plausible-sounding invented detail.
+- NO superlatives or rankings you cannot source from the profile: no "best", "#1",
+  "top-rated", "voted", "award-winning", "leading", "premier", "world-class".
+- NO invented amenities or logistics: parking, refreshments, insurance, financing,
+  board certifications, years in business, staff counts, service areas — unless they
+  appear in the profile.
+- Testimonials: quote ONLY from quotable_reviews_4_5_star_only below. Light cleanup
+  only — never append, embellish, or invent words the reviewer did not write, and
+  never stitch a quote from more than one review.
+- Days / hours: the business is open EXACTLY {open_days} day(s) per week. If you state
+  a "days per week" figure, use that number verbatim; render the hours exactly as
+  listed. Do NOT count or infer your own day total.
 
 BUSINESS PROFILE:
 {json.dumps(business, indent=2)}
@@ -447,8 +592,14 @@ BUSINESS PROFILE:
 Return only the HTML, nothing else."""
 
 
-def critique(conn, lead, html: str) -> tuple[bool, str]:
-    """Pass 2 text-only self-critique against the rubric (Principle 6, Phase B)."""
+CRITIQUE_KEYS = ("bespoke", "hero", "craft", "real", "imagery", "beats", "mobile")
+
+
+def critique(conn, lead, html: str) -> tuple[bool, str, bool]:
+    """Pass 2 text-only self-critique against the rubric (Principle 6, Phase B).
+
+    Returns (passed, fixes, weak). `weak` means it passed but some core factor
+    scored a 4 — "fine, forgettable" territory — so one polish pass is worth it."""
     prompt = f"""Review this generated sample website HTML against the rubric. Be harsh.
 
 RUBRIC (score each 1-5):
@@ -457,24 +608,111 @@ RUBRIC (score each 1-5):
 THE BUSINESS: {lead['business_name']} ({lead['category']})
 THE WEAKNESS THIS MUST FIX: {lead['qualify_reason'] or 'no web presence'}
 
-Return STRICT JSON only: {{"verdict": "PASS" or "FAIL", "scores": {{...}}, "fixes": ["specific fix", ...]}}
-FAIL if any of bespoke / hero / not-basic / beats / mobile / imagery scores below 4.
+Return STRICT JSON only, scoring EXACTLY these keys:
+{{"verdict": "PASS" or "FAIL", "scores": {{"bespoke": n, "hero": n, "craft": n, "real": n, "imagery": n, "beats": n, "mobile": n}}, "fixes": ["specific fix", ...]}}
+FAIL if any of bespoke / hero / craft / beats / mobile / imagery scores below 4.
+Even on PASS, list the fixes that would lift any 4 to a 5.
 
 HTML:
 {html[:60000]}"""
     raw = _call_claude(conn, "You are a strict design reviewer.", prompt,
                        lead["id"], "sample_critique")
     if raw is None:
-        return True, ""  # budget-blocked: don't fail the sample over the critique
+        return True, "", False  # budget-blocked: don't fail the sample over the critique
     try:
         data = json.loads(re.search(r"\{.*\}", raw, re.S).group(0))
-        return data.get("verdict") == "PASS", "; ".join(data.get("fixes", []))
-    except (AttributeError, json.JSONDecodeError):
+        scores = data.get("scores") or {}
+        core = [int(scores[k]) for k in CRITIQUE_KEYS
+                if isinstance(scores.get(k), (int, float))]
+        passed = data.get("verdict") == "PASS"
+        weak = passed and bool(core) and min(core) <= 4
+        return passed, "; ".join(data.get("fixes", [])), weak
+    except (AttributeError, ValueError, json.JSONDecodeError):
         log.warning("critique returned unparseable JSON; passing by default")
+        return True, "", False
+
+
+# Claim words that are almost never truthfully sourceable for a small business and
+# were seen invented in calibration. Each is allowed ONLY if it also appears in the
+# business's own source text (e.g. a real review that says "best place for your face").
+BANNED_CLAIMS = (
+    "best ", "#1", "number one", "top-rated", "top rated", "voted", "award-winning",
+    "award winning", "world-class", "world class", "board-certified",
+    "board certified", "free parking", "financing available", "guaranteed",
+)
+
+
+def fact_check(conn, lead, profile: dict, html: str) -> tuple[bool, str]:
+    """Grounding pass: verify every factual claim in the page is supported by the
+    business's REAL data. Returns (ok, "unsupported claim; unsupported claim").
+
+    This is the check the design `critique()` structurally cannot do — the critique
+    never sees the source facts, so invention (fake amenities, superlatives, wrong
+    day-counts, laundered quotes) slips past it. Cheap Haiku-class, text-only.
+    """
+    if not config.ANTHROPIC_API_KEY:
+        return True, ""
+    if costs.check(conn, "claude", FACT_CHECK_USD) == "block":
+        return True, ""  # budget-blocked: don't fail the sample over the fact-check
+    hours = profile.get("hours") or []
+    facts = {
+        "name": lead["business_name"], "category": lead["category"],
+        "phone": lead["phone"], "address": lead["address"],
+        "rating": lead["rating"], "review_count": lead["review_count"],
+        "hours": hours,
+        "open_days_per_week": sum(1 for h in hours if "closed" not in h.lower()),
+        "summary": profile.get("summary"),
+        "reviews_with_ratings": profile.get("reviews"),
+    }
+    trimmed = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html,
+                     flags=re.S | re.I)[:45000]
+    prompt = f"""You are fact-checking a sales sample website against the ONLY verified
+data about a real business. List every factual claim on the page that is NOT supported
+by that data.
+
+FLAG: services/treatments not evidenced in the data; amenities (parking, refreshments,
+insurance, financing); credentials or certifications; superlatives/rankings ("best",
+"#1", "award-winning", "top-rated") not in the data; a stated days-per-week other than
+{facts['open_days_per_week']}; testimonial quotes that are not from a 4-5 star review or
+that add/alter words the reviewer wrote.
+Do NOT flag generic benefit/marketing language that asserts no specific fact (e.g.
+"results that look like you"). Be precise and conservative — only genuine unsupported
+factual claims.
+
+VERIFIED DATA:
+{json.dumps(facts, indent=2)}
+
+PAGE HTML:
+{trimmed}
+
+Return STRICT JSON only: {{"ok": true|false, "unsupported": ["<claim> - <why>", ...]}}"""
+    try:
+        client = _claude()
+        resp = client.messages.create(
+            model=config.MODEL_CLASSIFIER, max_tokens=600,
+            system="You are a strict, conservative fact-checker.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        costs.record(conn, "claude", "sample_factcheck",
+                     costs.claude_cost(config.MODEL_CLASSIFIER,
+                                       resp.usage.input_tokens,
+                                       resp.usage.output_tokens),
+                     lead_id=lead["id"], tokens_in=resp.usage.input_tokens,
+                     tokens_out=resp.usage.output_tokens)
+        conn.commit()
+        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+        unsupported = [u for u in (data.get("unsupported") or []) if u]
+        return (data.get("ok", True) and not unsupported), "; ".join(unsupported)
+    except (AttributeError, json.JSONDecodeError):
+        log.warning("fact_check unparseable response; passing by default")
+        return True, ""
+    except Exception:
+        log.exception("fact_check failed")
         return True, ""
 
 
-def structural_gate(html: str, lead, images: list[str]) -> str | None:
+def structural_gate(html: str, lead, images: list[str],
+                    source_text: str = "") -> str | None:
     """Doc 01 STEP 3 hard-defect gate. Returns None if OK, else the failure."""
     lower = html.lower()
     if lead["business_name"].lower() not in lower:
@@ -494,6 +732,12 @@ def structural_gate(html: str, lead, images: list[str]) -> str | None:
             return f"invented image URL: {src[:80]}"
     if images and not srcs:
         return "good real photo available but page fell back to no images"
+    # unsourced superlatives / invented claims (checks alt text + overlays too, since
+    # this scans raw HTML — that's where "best in Plano" hid on lead 60)
+    src = (source_text or "").lower()
+    hits = sorted({b.strip() for b in BANNED_CLAIMS if b in lower and b not in src})
+    if hits:
+        return "unsourced claim(s): " + ", ".join(hits)
     try:
         BeautifulSoup(html, "lxml")
     except Exception:
@@ -514,33 +758,67 @@ def build_one(conn, lead) -> bool:
     profile = json.loads(lead["source_profile"] or "{}")
     brief = niche_brief(lead["category"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
-    images, image_source = select_images(conn, lead, profile)
+    images, image_source = select_images(conn, lead, profile, brief)
     brand = extract_brand(lead["existing_website"]) if lead["existing_website"] else {}
     if brand:
         log.info("lead %s brand: colors=%s fonts=%s logo=%s", lead["id"],
                  brand.get("colors"), brand.get("fonts"), bool(brand.get("logo")))
     # the real logo is a legitimate image even if it isn't in the photo `images`
     allowed_images = images + ([brand["logo"]] if brand.get("logo") else [])
+    # everything we can truthfully say about them — the claim gate allows a banned
+    # word only if it appears here (e.g. a review literally saying "best place")
+    source_text = " ".join([
+        lead["business_name"] or "", lead["category"] or "",
+        profile.get("summary") or "",
+        *[r.get("text", "") for r in (profile.get("reviews") or [])],
+    ])
 
-    prompt = build_prompt(lead, brief, archetype, images, profile, brand)
+    system = "You are an expert web designer."
+    style_ctx = _style_context(niche_key(lead["category"]))
+    if style_ctx:
+        system += "\n\n" + style_ctx
+
+    base_prompt = build_prompt(lead, brief, archetype, images, profile, brand,
+                               image_source)
+    feedback: list[str] = []
     html, failure = None, "no attempts made"
+    critiqued = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        raw = _call_claude(conn, "You are an expert web designer.", prompt,
+        raw = _call_claude(conn, system, (base_prompt, "\n\n".join(feedback)),
                            lead["id"], f"sample_generate_a{attempt}")
         if raw is None:
             failure = "claude budget blocked"
             break
         candidate = extract_html(raw)
-        failure = structural_gate(candidate, lead, allowed_images)
+        failure = structural_gate(candidate, lead, allowed_images, source_text)
         if failure:
             log.info("lead %s attempt %s failed gate: %s", lead["id"], attempt, failure)
-            prompt += f"\n\nPREVIOUS ATTEMPT FAILED THE QUALITY GATE: {failure}. Fix that."
+            feedback.append(
+                f"PREVIOUS ATTEMPT FAILED THE QUALITY GATE: {failure}. Fix that.")
             continue
-        if attempt == 1:
-            ok, fixes = critique(conn, lead, candidate)
-            if not ok and fixes:
-                log.info("lead %s critique fixes: %s", lead["id"], fixes[:200])
-                prompt += f"\n\nA design review of your previous attempt required these fixes — apply them all:\n{fixes}"
+        # grounding fact-check — reject any invented claim before design polish
+        fact_ok, fact_fixes = fact_check(conn, lead, profile, candidate)
+        if not fact_ok and fact_fixes:
+            log.info("lead %s attempt %s fact-check flagged: %s",
+                     lead["id"], attempt, fact_fixes[:200])
+            feedback.append(
+                "FACT-CHECK — these claims are NOT supported by the business's "
+                "real data. Remove or rewrite each so the page states only "
+                "verified facts:\n" + fact_fixes)
+            html = candidate  # fallback if later attempts regress
+            continue
+        # one critique-driven refine per lead: on FAIL it's mandatory, and a
+        # PASS with any core factor at 4 ("fine, forgettable") earns the same
+        # single polish pass — the cached base prompt makes the retry cheap
+        if not critiqued and attempt < MAX_ATTEMPTS:
+            critiqued = True
+            ok, fixes, weak = critique(conn, lead, candidate)
+            if fixes and (not ok or weak):
+                log.info("lead %s critique (%s): %s", lead["id"],
+                         "FAIL" if not ok else "PASS-but-weak", fixes[:200])
+                feedback.append(
+                    "A design review of your previous attempt required these "
+                    "fixes — apply them all:\n" + fixes)
                 html = candidate  # keep as fallback if the refine pass regresses
                 continue
         html = candidate

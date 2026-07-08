@@ -7,6 +7,10 @@
   python run.py followups [--dry-run]
   python run.py status               # print funnel counts + MTD spend
   python run.py grade <id> <ABCDEFG> <overall> [note]   # log a manual sample grade
+  python run.py vision <id ...>      # laptop: screenshot + AI vision grade (assist)
+  python run.py vision --url <url> [context]            # grade any live sample URL
+  python run.py insights             # grade averages by niche/imagery/archetype + notes
+  python run.py exemplar <id>        # distill a top-graded sample into a style crib
 
 The two long-running processes are separate systemd services:
   python serve_samples.py   and   python watch_replies.py
@@ -112,6 +116,19 @@ def main():
                 print(f"\nacross {avg['n']} graded sample(s):")
                 print("  " + "  ".join(
                     f"{l}={avg[l]:.1f}" for l in (*labels, "overall") if avg.get(l) is not None))
+    elif job == "vision":
+        import calibrate
+        calibrate.vision_command(sys.argv[2:])
+    elif job == "insights":
+        import calibrate
+        calibrate.print_insights()
+    elif job == "exemplar":
+        if len(sys.argv) < 3 or not sys.argv[2].isdigit():
+            print("usage: run.py exemplar <lead_id>   (grade it first; only "
+                  "distill samples you'd be proud to send)")
+            sys.exit(1)
+        import calibrate
+        calibrate.save_exemplar(int(sys.argv[2]))
     elif job == "status":
         with db.connect() as conn:
             import costs

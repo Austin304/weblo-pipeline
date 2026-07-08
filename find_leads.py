@@ -335,20 +335,24 @@ def qualify(conn, place: dict) -> tuple[str, str]:
     lower = html.lower()
     if "lorem ipsum" in lower:
         reasons.append("lorem ipsum placeholder text")
-    if 'name="viewport"' not in lower:
-        reasons.append("not mobile responsive (no viewport meta)")
-    years = re.findall(r"(?:©|&copy;|copyright)\D{0,10}(20\d\d)", lower)
-    if years:
-        newest = max(int(y) for y in years)
-        if newest <= 2022:
-            reasons.append(f"copyright footer © {newest}")
 
+    # STRONG, objective neglect signals only (no HTTPS, free-builder subdomain,
+    # placeholder text) are decisive — each justifies a "we can do better" pitch
+    # on its own without a style judgment.
     if reasons:
         return "OUTDATED", " + ".join(reasons[:3])
 
-    # technically clean — but the checks above can't SEE visual dating. Ask the
-    # model to read the HTML before we skip it (recovers dated-but-technically-ok
-    # sites; conservative so good sites still skip). Blind spot fix.
+    # For every other technically-clean site, the conservative AI visual judge is
+    # the ONLY path to OUTDATED. It reads the raw HTML (including whether the site
+    # is mobile-responsive) and only says "dated" on clear signals, so a good,
+    # modern site is never mislabeled.
+    #
+    # We deliberately do NOT treat a stale copyright-footer year or a missing
+    # viewport meta as decisive anymore. A "© 2022" footer is not evidence of a
+    # dated design — plenty of modern sites never bump the year — and that rule
+    # was producing false OUTDATED pitches to businesses whose live sites are
+    # actually strong (e.g. Euro Image, Injexed). The AI judge flags genuine
+    # non-responsiveness / dating from the HTML itself.
     ai_reason = ai_looks_dated(conn, html, place)
     if ai_reason:
         return "OUTDATED", f"AI: {ai_reason}"
@@ -550,9 +554,13 @@ def top_up(location: str | None = None, niche: str | None = None,
                 for rv in details.get("reviews", [])[:5]
                 if rv.get("text")
             ]
-            photos = [p.get("photo_reference")
-                      for p in details.get("photos", [])[:8]
-                      if p.get("width", 0) >= 800]
+            # keep dimensions so build_sample can rank hero candidates
+            # (landscape ≥1200 wide first) and reject logo-shaped images
+            photos = [{"ref": p["photo_reference"], "w": p.get("width", 0),
+                       "h": p.get("height", 0)}
+                      for p in details.get("photos", [])[:10]
+                      if p.get("photo_reference")
+                      and max(p.get("width", 0), p.get("height", 0)) >= 800]
 
             profile = {
                 "place_id": place.get("id"),
@@ -561,7 +569,7 @@ def top_up(location: str | None = None, niche: str | None = None,
                 "summary": (details.get("editorial_summary") or {}).get(
                     "overview", ""),
                 "reviews": reviews,
-                "photo_names": photos,
+                "photos": photos,
             }
 
             status = "FOUND"

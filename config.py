@@ -58,6 +58,9 @@ def get_float(key: str, default: float) -> float:
 ANTHROPIC_API_KEY = get("ANTHROPIC_API_KEY")
 GOOGLE_PLACES_API_KEY = get("GOOGLE_PLACES_API_KEY")
 ZEROBOUNCE_API_KEY = get("ZEROBOUNCE_API_KEY")  # optional; MX fallback if blank
+# optional free stock-photo APIs (image ladder step 3; both free tiers)
+PEXELS_API_KEY = get("PEXELS_API_KEY")
+UNSPLASH_ACCESS_KEY = get("UNSPLASH_ACCESS_KEY")
 DB_PATH = str((_HERE / get("DB_PATH", "leads.db")).resolve()) if not os.path.isabs(get("DB_PATH", "leads.db")) else get("DB_PATH")
 
 # --- samples / tunnel ---
@@ -65,6 +68,9 @@ SAMPLES_PORT = get_int("SAMPLES_PORT", 8788)
 SAMPLE_BASE_URL = (get("SAMPLE_BASE_URL") or "").rstrip("/")
 SAMPLES_CACHE_DIR = _HERE / "samples_cache"
 LOGS_DIR = _HERE / "logs"
+# distilled style cribs from top-graded samples + curated grading lessons;
+# injected into the generator's system prompt (see build_sample._style_context)
+EXEMPLARS_DIR = _HERE / "exemplars"
 
 # --- telegram ---
 TELEGRAM_BOT_TOKEN = get("TELEGRAM_BOT_TOKEN")
