@@ -159,11 +159,15 @@ RUBRIC = """- Bespoke, not templated: looks designed for THIS business, and USES
   brand (logo + colors) when provided — not a generic per-niche palette (most important)
 - Hero lands: a real marketing HEADLINE + one strong CTA over imagery in the first
   screen — NOT an app-store-style card (stacked name + description + star-rating badge)
-- Not basic: premium feel, whitespace, clear type scale, section variety (not a plain
-  centered text stack)
+- Not basic — THE most common failure: "clean but plain" / "a tidy brochure" scores LOW.
+  Premium demands dramatic type-scale contrast (oversized display + small uppercase kicker),
+  a distinctive type pairing (NOT Inter/Roboto/Arial/system-ui, no script/squiggle fonts),
+  editorial/asymmetric layout (not a centered stack), and real section-to-section variety
 - Real & specific: real name, services, review quotes, contact; zero invented facts
-- Imagery: a real, good photo present and well-placed (not a gradient default)
-- Visual craft: balanced spacing, consistent type scale, sufficient contrast
+- Imagery: a real, good photo present, well-cropped (object-fit: cover, subject in frame,
+  not sliced or stretched) and well-placed — not a gradient default or an awkward crop
+- Visual craft: consistent spacing & radius system, generous section padding, confident
+  color use, considered detail (dividers, kickers, hover states) — not flat and templated
 - Beats their current site WITHOUT A DOUBT: a clear, major upgrade — if it only reads
   as comparable or marginally better than a dated small-business site, this scores low
 - Mobile: responsive, no horizontal scroll, tap targets big enough"""
@@ -725,11 +729,26 @@ side-by-side split, not stretched across a wide hero. The hero image must be
 LARGE and immersive (a tall band or full-bleed section, not a thin strip), and on
 mobile it must keep a sensible height and its subject in frame. In grids, give
 every image the SAME aspect-ratio so the row stays even.
-CRAFT (avoid "basic"): make it feel premium and designed, not a plain vertical stack of
-centered text blocks. Use generous whitespace, a clear type scale (large confident
-headings, comfortable body), real visual variety between sections (alternating layouts,
-an image band, a stats or services grid), and thoughtful detail. Aim for "a designer
-made this for me," not "a competent template."
+CRAFT — this is the #1 thing separating "a designer made this" from "a competent
+template." "Clean but plain" / "a tidy brochure" is a FAILURE, not a pass. Concrete
+techniques to actually reach premium:
+- DRAMATIC type scale: an oversized display headline (e.g. clamp(2.5rem, 6vw, 5rem))
+  paired with a SMALL uppercase eyebrow/kicker label (letter-spaced ~0.1em) above section
+  headings. Big contrast between display and body is the cheapest premium win.
+- DISTINCTIVE type: a characterful display face (a real serif, or a strong display sans)
+  for headings + a clean readable body face. NEVER default to Inter, Roboto, Arial, or
+  system-ui, and no decorative "squiggle"/script fonts — generic or gimmicky type is the
+  #1 "AI slop" tell.
+- EDITORIAL layout, not a centered stack: use asymmetry — offset or left-aligned section
+  headings, split sections (text one side, image the other), a wide full-bleed color or
+  image band. No two ADJACENT sections should share the same layout.
+- CONSIDERED detail: generous section padding (~80-120px desktop), a consistent radius and
+  spacing system, hairline dividers or numbered sections (01 / 02 / 03), tight heading
+  letter-spacing with roomy body line-height (~1.6), and buttons with real padding + a
+  hover state.
+- CONFIDENT color: deploy the brand accent decisively (e.g. one full-bleed accent band or
+  section), not timid gray-on-white throughout — but don't flood every section either.
+Aim for something the owner would be proud to show off, not a page that reads as generic.
 
 Required sections: a hero (per HERO above), services, why-choose-us,
 testimonials pulled ONLY from the provided 4-5★ reviews (lightly cleaned, attributed
