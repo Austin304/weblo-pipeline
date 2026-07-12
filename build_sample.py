@@ -4,6 +4,7 @@ Quality engine per sample-design-system.md: image ladder, per-niche art
 direction, layout archetypes, gap-fixing, multi-pass generate -> critique.
 Publishing = writing samples_cache/<slug>/index.html for serve_samples.py.
 """
+import hashlib
 import json
 import logging
 import re
@@ -20,7 +21,16 @@ import db
 
 log = logging.getLogger(__name__)
 
-MAX_ATTEMPTS = 3          # total generation attempts (doc 01 STEP 2/3)
+MAX_ATTEMPTS = 2          # total generation attempts. Facts are now assembled in
+                          # code (assemble_content_blocks), so attempt 1 is honest by
+                          # construction; attempt 2 is one targeted fix/polish pass.
+                          # Full-page regeneration is expensive — cap the churn.
+# Calibration: when both attempts leave a residual prose flag, ship the last
+# structurally-sound candidate WITH a fact_flagged note (so factor-F grading catches
+# it) instead of SAMPLE_FAILED — a dead lead teaches nothing and wastes two builds.
+# The factual scaffolding is honest either way (it's code-assembled). Flip to False
+# before go-live if you want strict fail-closed on any residual flag.
+SHIP_WHEN_FACT_FLAGGED = True
 GEN_MAX_TOKENS = 16000
 EST_GEN_USD = 0.45        # worst-case pre-call estimate (doc 08: estimate from max_tokens)
 FACT_CHECK_USD = 0.03     # cheap Haiku grounding pass; real cost ~0.005
@@ -37,6 +47,12 @@ def _as_int(v, default: int = 0) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def _alnum(s: str) -> str:
+    """Lowercased alphanumeric-only form — for whitespace/punctuation-insensitive
+    substring matching (e.g. verifying a fact-check quote is really on the page)."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 # --- Principle 2: per-niche art direction ---------------------------------
 NICHE_BRIEFS = {
@@ -311,25 +327,71 @@ def site_images(website: str) -> list[str]:
         return []
 
 
+STOCK_USED_FILE = config.LOGS_DIR / "used_stock.json"
+
+
+def _stock_id(url: str) -> str:
+    """Stable per-photo key so the same Pexels/Unsplash photo dedupes across builds
+    regardless of size/query-string variation (e.g. .../photos/3757952/... -> 3757952)."""
+    m = re.search(r"/photos/(\d+)/", url) or re.search(r"photo-([\w-]+)", url)
+    return m.group(1) if m else url
+
+
+def _used_stock() -> set[str]:
+    try:
+        return set(json.loads(STOCK_USED_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def remember_stock(urls: list[str]) -> None:
+    """Persist the stock photos a shipped sample actually used, so later builds pick
+    DIFFERENT ones — Austin flagged identical stock photos across samples (215/230)."""
+    ids = {_stock_id(u) for u in urls if "pexels.com" in u or "unsplash.com" in u}
+    if not ids:
+        return
+    try:
+        STOCK_USED_FILE.parent.mkdir(exist_ok=True)
+        STOCK_USED_FILE.write_text(json.dumps(sorted(_used_stock() | ids)), encoding="utf-8")
+    except Exception:
+        log.warning("could not persist used stock")
+
+
+def _dedupe_pool(urls: list[str], lead, limit: int) -> list[str]:
+    """Drop photos already used by other samples; rotate the remainder by lead id so
+    two leads drawing the same pool still get different candidates. Falls back to the
+    (rotated) full pool if dedupe would leave too few to choose from."""
+    used = _used_stock()
+    fresh = [u for u in urls if _stock_id(u) not in used]
+    pool = fresh if len(fresh) >= min(3, len(urls)) else urls
+    if pool:
+        off = lead["id"] % len(pool)
+        pool = pool[off:] + pool[:off]
+    return pool[:limit]
+
+
 def stock_images(lead, brief: dict, limit: int = 8) -> list[str]:
     """Ladder step 3 — free niche stock (Pexels, then Unsplash). Both APIs are
     $0; a clean stock photo beats a typographic hero every time. Returns
     CANDIDATES (up to `limit`) — the generator picks the few that fit the
     palette/mood, so more choices = better odds of an on-brand hero. Returns []
-    when no key is configured or nothing landscape/large comes back."""
+    when no key is configured or nothing landscape/large comes back.
+
+    Fetches a LARGE pool and dedupes against photos other samples already used
+    (see _dedupe_pool) so no two samples share stock photos."""
     query = brief.get("stock_query") or "modern small business"
     if config.PEXELS_API_KEY:
         try:
             r = requests.get(
                 "https://api.pexels.com/v1/search",
-                params={"query": query, "per_page": 12,
+                params={"query": query, "per_page": 80,
                         "orientation": "landscape", "size": "large"},
                 headers={"Authorization": config.PEXELS_API_KEY}, timeout=15)
             if r.status_code == 200:
                 urls = [p["src"]["large2x"] for p in r.json().get("photos", [])
                         if p.get("width", 0) >= 1200 and p.get("src", {}).get("large2x")]
                 if urls:
-                    return urls[:limit]
+                    return _dedupe_pool(urls, lead, limit)
                 log.warning("pexels: 0 usable results for %r", query)
             else:
                 log.warning("pexels HTTP %s for %r: %s", r.status_code, query,
@@ -340,13 +402,13 @@ def stock_images(lead, brief: dict, limit: int = 8) -> list[str]:
         try:
             r = requests.get(
                 "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": 8, "orientation": "landscape",
+                params={"query": query, "per_page": 30, "orientation": "landscape",
                         "client_id": config.UNSPLASH_ACCESS_KEY}, timeout=15)
             if r.status_code == 200:
                 urls = [p["urls"]["regular"] for p in r.json().get("results", [])
                         if p.get("urls", {}).get("regular")]
                 if urls:
-                    return urls[:limit]
+                    return _dedupe_pool(urls, lead, limit)
         except requests.RequestException:
             log.warning("unsplash search failed for %r", query)
     return []
@@ -401,7 +463,11 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         "HERO background of a PREMIUM website: high-quality, well-composed, appealing "
         "and uncluttered at full width. A clinical close-up, a logo, a screenshot, a "
         "dim/cluttered/garish snapshot, or an awkward crop is a POOR hero (it may still "
-        "be usable small inside a section). Also note WHERE the main subject sits in the "
+        "be usable small inside a section). These are POOR heroes (hero=1) and 'use': "
+        "false unless nothing else exists: a photo with a VISIBLE WATERMARK or overlaid "
+        "text; a STOREFRONT / BUILDING EXTERIOR / street view / parking lot / signage "
+        "shot; a logo; or an obvious AMATEUR PHONE SNAPSHOT (harsh flash, tilted, messy "
+        "background). Also note WHERE the main subject sits in the "
         "frame, so a CSS crop can be aimed to keep it (a wide hero crops off top and "
         "bottom; a tall column crops off the sides)."}]
     for i, url in enumerate(urls):
@@ -543,6 +609,161 @@ def extract_brand(website: str) -> dict:
     return brand
 
 
+# --- Real facts from their own site (the copy-quality lever) ----------------
+# The verified-fact base was Google Places only (name/rating/hours/5 reviews),
+# so the generator had nothing SPECIFIC to say and fell back to generic mood-copy
+# ("Comfort first", "Results you'll love") — which reads worse than the owner's
+# real site. Their own website is a goldmine of true, specific facts (their actual
+# service list, their tagline). We extract those, ANCHOR every item to text that
+# really appears on their site (so an extraction slip can't leak an unsourced claim),
+# and feed them into LOCKED CONTENT + the fact-check's verified data.
+
+SITE_FACTS_USD = 0.02          # cheap Haiku extraction; real cost ~0.005
+SITE_FACTS_CACHE = config.LOGS_DIR / "site_facts_cache.json"
+
+
+def _url_key(url: str) -> str:
+    p = urlparse((url or "").lower())
+    return (p.netloc + p.path).rstrip("/") or (url or "").lower()
+
+
+def _cached_site_facts(url: str):
+    """Returns the cached facts dict, or None if this URL was never extracted.
+    (A cached {} means 'extracted, nothing usable' and is returned as {} — not None —
+    so we don't re-call Haiku for sites we already found barren.)"""
+    try:
+        data = json.loads(SITE_FACTS_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data.get(_url_key(url))
+
+
+def _remember_site_facts(url: str, facts: dict) -> None:
+    try:
+        SITE_FACTS_CACHE.parent.mkdir(exist_ok=True)
+        try:
+            data = json.loads(SITE_FACTS_CACHE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        data[_url_key(url)] = facts
+        SITE_FACTS_CACHE.write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        log.warning("could not persist site facts")
+
+
+def _site_text_for_facts(website: str) -> str:
+    """Homepage visible text (+ one services/menu page if linked) — the raw material
+    the service list is extracted from and anchored against."""
+    def page_text(url):
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        except requests.RequestException:
+            return "", None
+        if r.status_code >= 400 or not r.text:
+            return "", None
+        soup = BeautifulSoup(r.text, "lxml")
+        for t in soup(["script", "style", "noscript", "svg", "template"]):
+            t.decompose()
+        return re.sub(r"\s+", " ", soup.get_text(" ")).strip(), (soup, r.url)
+
+    text, meta = page_text(website)
+    if not meta:
+        return ""
+    soup, base = meta
+    for a in soup.find_all("a", href=True):
+        label = (a.get_text(" ") + " " + a["href"]).lower()
+        if any(k in label for k in ("service", "treatment", "menu", "what-we", "offerings")):
+            href = requests.compat.urljoin(base, a["href"])
+            if urlparse(href).netloc == urlparse(base).netloc and href != base:
+                more, _ = page_text(href)
+                if more:
+                    text += " " + more
+                break
+    return text[:12000]
+
+
+def extract_site_facts(conn, lead, website: str) -> dict:
+    """Extract the business's REAL services + tagline from their OWN site so the
+    sample's copy can be specific AND honest — the single biggest lever on "reads
+    worse than their existing site". STRICTLY SOURCED: every returned item is anchored
+    to text that actually appears on their page, so an extraction hallucination cannot
+    leak an unsourced claim into LOCKED CONTENT. Cached per-URL (calibration rebuilds
+    are then free). Returns {} when there's no usable site or nothing extractable —
+    never fails a build (this is an enhancement, not a gate)."""
+    if not website or not config.ANTHROPIC_API_KEY:
+        return {}
+    cached = _cached_site_facts(website)
+    if cached is not None:
+        return cached
+    text = _site_text_for_facts(website)
+    if len(text) < 120:
+        _remember_site_facts(website, {})
+        return {}
+    if costs.check(conn, "claude", SITE_FACTS_USD) == "block":
+        return {}
+    prompt = f"""From this business's OWN website text, extract ONLY what the site itself states.
+Do NOT infer, guess, or add anything typical-for-the-industry that isn't written here.
+
+Return STRICT JSON only:
+{{"services": ["<exact service / treatment names the site says they offer — short noun phrases, max 10>"],
+  "tagline": "<their own headline or tagline, copied verbatim, or empty if none clearly is one>"}}
+
+Rules:
+- services: concrete NAMED offerings (e.g. "Botox", "Dermal Filler", "Microneedling",
+  "Laser Hair Removal"), NOT vague categories ("wellness", "beauty", "self-care"). Copy the
+  site's own wording. Omit prices and durations.
+- Include a service ONLY if the text names it. If the site names none, return [].
+- No superlatives, no invented specialties.
+
+WEBSITE TEXT:
+{text}"""
+    try:
+        client = _claude()
+        resp = client.messages.create(
+            model=config.MODEL_CLASSIFIER, max_tokens=500,
+            system="You extract only facts explicitly present in the given text. Never infer.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        costs.record(conn, "claude", "site_facts_extract",
+                     costs.claude_cost(config.MODEL_CLASSIFIER,
+                                       resp.usage.input_tokens, resp.usage.output_tokens),
+                     lead_id=lead["id"], tokens_in=resp.usage.input_tokens,
+                     tokens_out=resp.usage.output_tokens)
+        conn.commit()
+        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+    except (AttributeError, json.JSONDecodeError):
+        log.warning("site_facts unparseable; skipping")
+        _remember_site_facts(website, {})
+        return {}
+    except Exception:
+        log.exception("site_facts extract failed")
+        return {}  # transient (e.g. API) — don't cache, allow a later retry
+    # ANCHOR every item to their real site text — this is the strictly-sourced guarantee
+    site_norm = _alnum(text)
+    services, seen = [], set()
+    for s in (data.get("services") or []):
+        s = re.sub(r"\s+", " ", str(s)).strip(" .-–—•")
+        key = _alnum(s)
+        if 2 <= len(key) <= 40 and len(s) <= 40 and key in site_norm and key not in seen:
+            seen.add(key)
+            services.append(s)
+        if len(services) >= 10:
+            break
+    tagline = re.sub(r"\s+", " ", str(data.get("tagline") or "")).strip()
+    if not (8 <= len(tagline) <= 120 and _alnum(tagline) in site_norm):
+        tagline = ""
+    facts = {}
+    if services:
+        facts["services"] = services
+    if tagline:
+        facts["tagline"] = tagline
+    _remember_site_facts(website, facts)
+    if facts:
+        log.info("lead %s site facts: %d service(s)%s", lead["id"], len(services),
+                 " + tagline" if tagline else "")
+    return facts
+
+
 # --- Principles 4-5: prompt + multi-pass -----------------------------------
 
 def _claude():
@@ -584,6 +805,67 @@ def _call_claude(conn, system: str, user, lead_id: int,
                  tokens_out=usage.output_tokens)
     conn.commit()
     return resp.content[0].text
+
+
+# DESIGN-LANGUAGE MENU — distilled from the three reference med-spa sites Austin
+# picked (marasmedspa / medspafm / navamedicalspa). Rotated one-per-lead so samples
+# STOP converging on the same warm-blush-serif-centered template (his "they all feel
+# template" note). Each is a distinct, committed aesthetic. Design DNA only — never
+# their content/photos/brand. A real brand palette (OUTDATED leads) still overrides.
+DESIGN_LANGUAGES = (
+    {   # 1. DARK LUXE (maras) — restrained, gold-on-charcoal, editorial
+        "name": "Dark Luxe",
+        "palette": "a deep charcoal / near-black base (#16181c–#1f2328) with warm "
+                   "cream sections and ONE confident gold accent (#c8a96a); solid "
+                   "black buttons — never timid gray-on-white",
+        "type": "a high-contrast editorial serif display (Playfair/Didot-style) with "
+                "small UPPERCASE letter-spaced kicker labels above headings, over a "
+                "clean sans body (Montserrat/Inter-alt)",
+        "layout": "a dramatic full-bleed hero image with a dark scrim and centered "
+                  "serif headline; a horizontal row of 3–4 icon + short-label cards; "
+                  "an even service grid with a subtle gold hairline/badge per card; "
+                  "one confident full-bleed dark band. Generous 80–120px section padding",
+        "motion": "scroll-reveal (fade + translateY) and gold-underline/lift on hover"},
+    {   # 2. WARM EDITORIAL (medspafm) — mocha/rose, asymmetric splits
+        "name": "Warm Editorial",
+        "palette": "warm mocha/clay (#8f6e56) + soft rose-clay (#d1a394) + warm cream "
+                   "whites; a brown/clay accent used decisively in one full-bleed band",
+        "type": "a high-contrast serif display that MIXES an italic serif line with an "
+                "UPPERCASE serif line (e.g. \"Flower Mound's / PREMIER MED SPA\"), "
+                "UPPERCASE kicker labels, clean sans body",
+        "layout": "ASYMMETRIC and editorial — LEFT-aligned hero text over a full-bleed "
+                  "image; a welcome section that SPLITS image on one side, text + a 2×2 "
+                  "feature-card cluster on the other; services as a clean list separated "
+                  "by hairline dividers with arrow affordances (not always boxed cards); "
+                  "a warm full-bleed accent band near the end. No two adjacent sections share a layout",
+        "motion": "IntersectionObserver scroll-reveal + card/button hover-lift (pop)"},
+    {   # 3. AIRY MINIMAL (nava) — white, one bold accent, big whitespace
+        "name": "Airy Minimal",
+        "palette": "mostly white / off-white with near-black text and ONE bold saturated "
+                   "accent (a deep plum-violet #6d4aa3 OR a deep emerald — pick what fits "
+                   "the business), used sparingly in one divider band + links/buttons",
+        "type": "large, LEFT-aligned classic serif headings with very roomy line-height, "
+                "tiny UPPERCASE letter-spaced section labels, airy sans body",
+        "layout": "minimal and gallery-like with LOTS of negative space; offset/asymmetric "
+                  "image blocks that bleed off one edge; a single bold accent divider band; "
+                  "very few boxed cards; oversized type carrying the hierarchy instead of borders",
+        "motion": "subtle scroll-reveal fades; minimal, calm hover states"},
+)
+
+
+def _render_design_language(dl: dict, has_brand: bool) -> str:
+    override = ("Their real brand colors/logo above OVERRIDE this palette; keep this "
+                "language's TYPE energy, LAYOUT and MOTION."
+                if has_brand else
+                "Commit FULLY to this language — do NOT drift back to a generic "
+                "warm-blush/sage centered spa template.")
+    return (f"COMMITTED DESIGN LANGUAGE for this build — \"{dl['name']}\" (every build "
+            f"gets a deliberately different one so no two samples look alike):\n"
+            f"  Palette: {dl['palette']}\n"
+            f"  Type: {dl['type']}\n"
+            f"  Layout: {dl['layout']}\n"
+            f"  Motion: {dl['motion']}\n"
+            f"  {override}")
 
 
 def _render_image_block(images: list[str], image_source: str,
@@ -636,10 +918,119 @@ def _render_image_block(images: list[str], image_source: str,
     return block
 
 
+MAX_TESTIMONIALS = 3          # how many verbatim quotes we lock into the page
+_TESTIMONIAL_MAX_CHARS = 420  # skip rambling reviews so the model never wants to trim
+
+
+def assemble_content_blocks(lead, profile: dict, site_facts: dict | None = None,
+                            drop_testimonials: bool = False) -> dict:
+    """Assemble EVERY factual element of the page IN CODE, verbatim, so the
+    generator never has to (and never gets to) invent or restate a fact.
+
+    This is the facts-in-code half of the split: the model receives these as
+    locked strings it must place unmodified and writes only benefit-language
+    copy + layout. Removes the fabrication surface that prompting could not
+    close (stitched/renamed testimonials, miscounted open-days, invented
+    amenities). `drop_testimonials` yields the honest aggregate-only fallback.
+
+    `site_facts` (from extract_site_facts) carries the business's REAL, strictly-
+    sourced service list + tagline from their own website — the substance that lets
+    the copy be specific instead of generic mood-filler.
+    """
+    site_facts = site_facts or {}
+    hours = [h for h in (profile.get("hours") or []) if h and h.strip()]
+    open_days = sum(1 for h in hours if "closed" not in h.lower())
+    rating = lead["rating"]
+    review_count = lead["review_count"]
+    rating_line = None
+    if rating and review_count:
+        # trim a trailing .0 so "5.0" reads as "5" only if it's whole
+        r = f"{rating:g}" if isinstance(rating, (int, float)) else str(rating)
+        rating_line = f"Rated {r} from {review_count} Google reviews"
+
+    testimonials: list[str] = []
+    if not drop_testimonials:
+        # Only 4-5 star reviews, whole and verbatim. Prefer shorter ones so the
+        # layout never tempts the model to trim (the reviews carry no author, so
+        # attribution is always the honest generic "— Google review").
+        quotable = [r["text"].strip() for r in (profile.get("reviews") or [])
+                    if (r.get("rating") or 0) >= 4 and (r.get("text") or "").strip()]
+        quotable = [t for t in quotable if 40 <= len(t) <= _TESTIMONIAL_MAX_CHARS]
+        quotable.sort(key=len)
+        testimonials = quotable[:MAX_TESTIMONIALS]
+
+    return {
+        "brand_name": _core_brand(lead["business_name"]) or lead["business_name"],
+        "full_name": lead["business_name"],
+        "rating_line": rating_line,
+        "phone": (lead["phone"] or "").strip() or None,
+        "address": (lead["address"] or "").strip() or None,
+        "hours": hours,
+        "open_days": open_days,
+        "testimonials": testimonials,
+        "attribution": "— Google review",
+        "real_services": site_facts.get("services") or [],
+        "tagline": site_facts.get("tagline") or None,
+    }
+
+
+def _render_content_contract(content: dict) -> str:
+    """The LOCKED CONTENT section of the gen prompt — verbatim facts the model
+    must reproduce exactly and may not add to."""
+    lines = [
+        "LOCKED CONTENT — this is the COMPLETE and ONLY set of facts about this business.",
+        "Reproduce each item below on the page EXACTLY as written, word for word. You may",
+        "wrap it in your own markup and style/position it, but you may NOT add to, remove",
+        "from, reword, paraphrase, re-order, translate, or \"fix\" the text of any item, and",
+        "you may state NO fact that is not here (see STRICT HONESTY).",
+        "",
+        f'  BUSINESS NAME (the brand, use throughout): {content["brand_name"]}',
+    ]
+    if content.get("real_services"):
+        lines.append(
+            '  REAL SERVICES — the ACTUAL services this business offers, taken from their '
+            'OWN website. Build the services section around THESE real named services (name '
+            'them, then sell each in warm benefit language). Do NOT replace them with vague '
+            'generic descriptions, and do NOT invent any other treatment/service not listed:')
+        lines += [f"    - {s}" for s in content["real_services"]]
+    if content.get("tagline"):
+        lines.append(
+            f'  THEIR TAGLINE (their own words, from their site) — you MAY use or lightly '
+            f'adapt it as headline/voice; it is not a checkable fact: "{content["tagline"]}"')
+    if content["rating_line"]:
+        lines.append(
+            f'  RATING LINE (show ONCE, in/near testimonials — never as a hero badge): '
+            f'"{content["rating_line"]}"')
+    if content["phone"]:
+        lines.append(f'  PHONE (use in the contact CTA): {content["phone"]}')
+    if content["address"]:
+        lines.append(f'  ADDRESS (use in hours/location): {content["address"]}')
+    if content["hours"]:
+        lines.append(
+            f'  HOURS — render this list EXACTLY; the business is open '
+            f'{content["open_days"]} day(s)/week, do NOT compute or state a different number:')
+        lines += [f"    - {h}" for h in content["hours"]]
+    if content["testimonials"]:
+        lines.append(
+            f'  TESTIMONIALS — place in a testimonials section; reproduce each quote '
+            f'VERBATIM and WHOLE, attributed EXACTLY "{content["attribution"]}" '
+            f'(never invent or add a reviewer name); show fewer if the layout needs, '
+            f'but never alter one:')
+        for i, t in enumerate(content["testimonials"], 1):
+            lines.append(f'    {i}. "{t}"')
+            lines.append(f'       {content["attribution"]}')
+    else:
+        lines.append(
+            "  TESTIMONIALS — none available to quote. In the trust/testimonials area show "
+            "ONLY the RATING LINE above (if any); add NO quoted text and invent no reviews.")
+    return "\n".join(lines)
+
+
 def build_prompt(lead, brief: dict, archetype: str, images: list[str],
-                 profile: dict, brand: dict, image_source: str = "",
-                 image_notes: dict | None = None) -> str:
+                 content: dict, brand: dict, image_source: str = "",
+                 image_notes: dict | None = None, design_language: dict | None = None) -> str:
     image_block = _render_image_block(images, image_source, image_notes)
+    design_block = _render_design_language(design_language, bool(brand)) if design_language else ""
     if brand:
         parts = []
         if brand.get("logo"):
@@ -670,31 +1061,20 @@ def build_prompt(lead, brief: dict, archetype: str, images: list[str],
             "ESTABLISH THEIR PRESENCE: they have no real website today. This is their first "
             "real web presence — make it genuinely impressive and credible, the kind of site "
             "that makes this business look established and trustworthy at a glance.")
-    hours = profile.get("hours") or []
-    open_days = sum(1 for h in hours if "closed" not in h.lower())
-    # Only 4-5★ reviews may be quoted — never launder a positive fragment out of a
-    # negative review (that misrepresents an unhappy customer and reads as dishonest
-    # to an owner who knows their own reviews).
-    quotable = [r for r in (profile.get("reviews") or [])
-                if (r.get("rating") or 0) >= 4 and r.get("text")]
-    business = {
-        "name": lead["business_name"], "category": lead["category"],
-        "phone": lead["phone"], "address": lead["address"],
-        "rating": lead["rating"], "review_count": lead["review_count"],
-        "hours": hours, "open_days_per_week": open_days,
-        "summary": profile.get("summary"),
-        "quotable_reviews_4_5_star_only": quotable,
-    }
+    open_days = content["open_days"]
+    content_contract = _render_content_contract(content)
     return f"""You are an expert web designer creating a sample site to win this local business as a client.
-Generate ONE complete, single-file, responsive HTML page (inline CSS, minimal/no JS), mobile-first.
+Generate ONE complete, single-file, responsive HTML page (inline CSS; a SMALL inline <script> is allowed ONLY for the tasteful motion described under MOTION below), mobile-first.
+
+{design_block}
 
 DESIGN DIRECTION (niche category: {lead['category']}):
   Mood: {brief['mood']}
-  Palette direction: {brief['palette']} — BUT if THEIR BRAND below gives colors, THOSE win
-  Type pairing: {brief['type_pairing']} — BUT if THEIR BRAND below gives fonts, use those
   Lead with: {brief['leading_section']}
   Primary CTA: {brief['primary_cta']}
   Imagery style: {brief['imagery']}
+  (Palette/type are set by the COMMITTED DESIGN LANGUAGE above — the niche default
+   "{brief['palette']}" is only a last resort if that is somehow absent.)
 LAYOUT ARCHETYPE (commit to this structure): {archetype}
 IMAGES TO USE (real, already selected — place them well; do not invent others):
 {image_block}
@@ -728,59 +1108,93 @@ belongs in a full-bleed band or hero, a portrait belongs in a tall column or a
 side-by-side split, not stretched across a wide hero. The hero image must be
 LARGE and immersive (a tall band or full-bleed section, not a thin strip), and on
 mobile it must keep a sensible height and its subject in frame. In grids, give
-every image the SAME aspect-ratio so the row stays even.
+every image the SAME aspect-ratio so the row stays even. Use each photo ONCE — NEVER
+repeat the hero image (or any photo) in a later section; if you run short of photos,
+use fewer image slots rather than duplicating one.
 CRAFT — this is the #1 thing separating "a designer made this" from "a competent
 template." "Clean but plain" / "a tidy brochure" is a FAILURE, not a pass. Concrete
 techniques to actually reach premium:
 - DRAMATIC type scale: an oversized display headline (e.g. clamp(2.5rem, 6vw, 5rem))
   paired with a SMALL uppercase eyebrow/kicker label (letter-spaced ~0.1em) above section
   headings. Big contrast between display and body is the cheapest premium win.
-- DISTINCTIVE type: a characterful display face (a real serif, or a strong display sans)
-  for headings + a clean readable body face. NEVER default to Inter, Roboto, Arial, or
-  system-ui, and no decorative "squiggle"/script fonts — generic or gimmicky type is the
-  #1 "AI slop" tell.
+- DISTINCTIVE type: a characterful display face for headings + a clean readable body face.
+  For a serif, choose a clean MODERN/editorial serif — a high-contrast Didot/Bodoni or a
+  crisp Playfair-style face — NOT an ornate, calligraphic, or handwritten serif with
+  decorative swashes or a curly, looping lowercase "f"/"g". NEVER default to Inter, Roboto,
+  Arial, or system-ui, and no decorative "squiggle"/script fonts — generic or gimmicky type
+  is the #1 "AI slop" tell.
 - EDITORIAL layout, not a centered stack: use asymmetry — offset or left-aligned section
   headings, split sections (text one side, image the other), a wide full-bleed color or
   image band. No two ADJACENT sections should share the same layout.
+- EDITORIAL ≠ RANDOM: asymmetry must look DELIBERATE. Everything aligns to a clear grid
+  with consistent, equal margins and a steady vertical rhythm; related items line up on
+  shared edges/baselines. Never let elements look randomly placed, off-center, or
+  haphazardly stacked — intentional alignment reads premium; scattered reads broken.
 - CONSIDERED detail: generous section padding (~80-120px desktop), a consistent radius and
   spacing system, hairline dividers or numbered sections (01 / 02 / 03), tight heading
   letter-spacing with roomy body line-height (~1.6), and buttons with real padding + a
   hover state.
 - CONFIDENT color: deploy the brand accent decisively (e.g. one full-bleed accent band or
   section), not timid gray-on-white throughout — but don't flood every section either.
+- TASTEFUL MOTION — this is what makes a page feel alive instead of flat, and it is
+  expected, not optional. Two things: (a) SCROLL-REVEAL: sections and cards start slightly
+  lowered and faded (opacity:0; transform: translateY(20px)) and ease to full
+  (opacity:1; translateY(0)) as they enter the viewport, driven by ONE small
+  IntersectionObserver script near </body>; (b) HOVER-LIFT: cards, service tiles, and
+  buttons rise on hover (transform: translateY(-4px) plus a stronger box-shadow) over a
+  ~150-250ms transition. Keep it subtle and quick — never bouncy, spinning, parallax, or
+  slow. MUST honor prefers-reduced-motion: reduce (no transforms/animation when set).
 Aim for something the owner would be proud to show off, not a page that reads as generic.
 
-Required sections: a hero (per HERO above), services, why-choose-us,
-testimonials pulled ONLY from the provided 4-5★ reviews (lightly cleaned, attributed
-"— Google review"), hours/location, and a clear contact CTA using their real phone/address.
+Required sections: a hero (per HERO above), services (if LOCKED CONTENT lists REAL
+SERVICES, build this section around those actual named services in warm benefit
+language — that specificity is what makes this beat a generic template; otherwise
+describe the general {lead['category']} experience in benefit language — never invent
+specific treatments, prices, or brands not in LOCKED CONTENT), why-choose-us, testimonials
+(built ONLY from LOCKED CONTENT below), hours/location, and a clear contact CTA using
+the locked phone/address.
 Include <meta name="viewport">. Semantic HTML, alt text, sufficient contrast.
 No lorem ipsum. No placeholder text. No fixed widths wider than the viewport.
 A tiny tasteful footer line "Sample design" is acceptable; never plaster SAMPLE across the page.
 
+{content_contract}
+
 STRICT HONESTY — this is what wins or loses the client. One invented fact the owner
 spots destroys all trust in the pitch, so treat this as harder than any design rule:
-- State ONLY facts present in the BUSINESS PROFILE below. If a section needs more
-  words, use benefit/experience language that asserts NO new fact — never fill a gap
-  with a plausible-sounding invented detail.
-- NO superlatives or rankings you cannot source from the profile: no "best", "#1",
-  "top-rated", "voted", "award-winning", "leading", "premier", "world-class".
-- NO invented amenities or logistics: parking, refreshments, insurance, financing,
-  board certifications, years in business, staff counts, service areas — unless they
-  appear in the profile.
-- Testimonials: quote ONLY from quotable_reviews_4_5_star_only below. Light cleanup
-  only — never append, embellish, or invent words the reviewer did not write, and
-  never stitch a quote from more than one review.
-- Shortening a quote: use ONE contiguous excerpt, trimming only whole sentences from
-  the start or end — never delete words or sentences from the middle. NEVER trim away
-  context that changes who the reviewer appears to be (e.g. a fellow professional or
-  trainee reading as a patient). If a review can't be excerpted honestly, quote it in
-  full or use a different one.
-- Days / hours: the business is open EXACTLY {open_days} day(s) per week. If you state
-  a "days per week" figure, use that number verbatim; render the hours exactly as
-  listed. Do NOT count or infer your own day total.
-
-BUSINESS PROFILE:
-{json.dumps(business, indent=2)}
+- The LOCKED CONTENT above is the COMPLETE set of facts about this business. Every
+  concrete, checkable claim on the page MUST be one of those items, reproduced exactly.
+  Anything NOT in LOCKED CONTENT is FORBIDDEN even if it's typical for the industry —
+  no parking, refreshments, drinks, financing, insurance, certifications, awards, years
+  in business, staff names/counts, specific prices, brand names, or named treatments.
+- What YOU write is the marketing VOICE only: the hero headline and short benefit
+  taglines / section intros. These must sell the EXPERIENCE with benefit language that
+  asserts NO new fact (e.g. "results that look like you", "care that feels personal").
+  If a sentence you write states something a customer could fact-check and it is not in
+  LOCKED CONTENT, delete it. When unsure whether something is a fact, assume it is and
+  leave it out.
+- NO superlatives or rankings: no "best", "#1", "top-rated", "voted", "award-winning",
+  "leading", "premier", "world-class" — none of these are in LOCKED CONTENT, so none
+  may appear.
+- Days / hours: state the hours EXACTLY as the LOCKED HOURS list; the business is open
+  EXACTLY {open_days} day(s) per week — never count or infer a different number.
+- COPY VOICE (judged hard — write like a real, warm, grounded person, NOT a brochure):
+  * NATURAL & CALM: short, confident sentences a native English speaker would actually
+    say. Read each line aloud — if it sounds stiff, translated, ESL-ish, or like filler,
+    rewrite it. Relaxed and warm, never salesy or breathless.
+  * GOOD AT DESCRIPTION: be concrete and lightly sensory about the ACTUAL experience
+    (the calm room, the unhurried visit, the natural-looking result) — plain vivid
+    English, not vague abstract benefit-speak.
+  * BANNED empty/abstract filler: "the kind of attention that feels personal", "a
+    considered approach", "subtle results and ...", "elevate your journey", "your journey
+    to ...", and similar hollow lines. Plain beats poetic every time.
+  * PERSONAL, NOT INVASIVE: warmth is good, but know when personal matters and never
+    overdo it — nothing that feels like someone wants to "crawl inside their skin" or is
+    fixated on the customer's body. BAN "around your face", "for your face", "your problem
+    areas", "work on your body". Speak to the person and the result, warmly and at a
+    respectful distance.
+  * Plain section labels ("Why us", "What we do", "Visit us") beat cutesy/flowery ones.
+  * Match this register: "Still every bit you." / "Results that look like you, only more
+    you." / "Come in, relax, and leave feeling like yourself."
 
 Return only the HTML, nothing else."""
 
@@ -842,19 +1256,81 @@ BANNED_CLAIMS = (
     "board certified", "free parking", "financing available", "guaranteed",
 )
 
+# Ranking/superlative overclaims the model reflexively writes into headlines despite
+# the ban ("prohibitions don't work — the generative prior wins"). These are pure
+# adjectives/phrases that degrade gracefully when simply removed, so we SCRUB them in
+# code before the gate rather than failing→retrying→killing the lead (leads 214 "best"
+# and 234 "#1" both died on exactly this). Amenity/credential claims (parking, board-
+# certified) are NOT scrubbed — removing them leaves broken prose; the fact-check +
+# degrade-not-die path handles those instead.
+SCRUB_SUPERLATIVES = (
+    "#1", "number one", "number-one", "top-rated", "top rated", "award-winning",
+    "award winning", "world-class", "world class", "voted", "best", "premier",
+    "leading", "most trusted", "unrivaled", "unmatched", "second to none",
+)
 
-def fact_check(conn, lead, profile: dict, html: str) -> tuple[bool, str]:
+
+def _scrub_superlatives(html: str, source_text: str = "") -> str:
+    """Remove unsourced ranking superlatives from visible text + alt/title/aria/meta,
+    leaving tags, URLs, and source-attested wording (e.g. a review that really says
+    "best place") untouched. Deterministic — no model, no retry.
+
+    Operates by regex on the raw string (text between > and <, plus specific attribute
+    values) — NEVER reparses/reserializes the page. An earlier BeautifulSoup version
+    reordered <meta> attributes on str(soup) and broke the viewport gate check."""
+    src = (source_text or "").lower()
+    terms = [t for t in SCRUB_SUPERLATIVES if t not in src]
+    if not terms:
+        return html
+    pat = re.compile(
+        r"(?<![\w#])(?:the\s+|a\s+|our\s+)?(?:" +
+        "|".join(re.escape(t) for t in sorted(terms, key=len, reverse=True)) +
+        r")(?![\w-])",
+        re.I)
+    removed: list[str] = []
+
+    def _tidy(s: str) -> str:
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        s = re.sub(r"\s+([,.!?;:])", r"\1", s)
+        return s
+
+    def _do(text: str) -> str:
+        if not pat.search(text):
+            return text
+        removed.extend(m.group(0).strip() for m in pat.finditer(text))
+        return _tidy(pat.sub("", text))
+
+    # visible text nodes only (content between a '>' and the next '<' — never inside a tag)
+    out = re.sub(r"(>)([^<]*)(<)", lambda m: m.group(1) + _do(m.group(2)) + m.group(3), html)
+    # specific attribute values where overclaims sometimes hide (alt/overlay/meta desc)
+    for q in ('"', "'"):
+        out = re.sub(
+            r"((?:alt|title|aria-label|content)\s*=\s*" + q + r")([^" + q + r"]*)(" + q + r")",
+            lambda m: m.group(1) + _do(m.group(2)) + m.group(3), out, flags=re.I)
+    if removed:
+        log.info("scrubbed %d superlative(s): %s", len(removed),
+                 ", ".join(sorted(set(removed)))[:150])
+    return out
+
+
+def fact_check(conn, lead, profile: dict, html: str,
+               site_facts: dict | None = None) -> tuple[bool, str]:
     """Grounding pass: verify every factual claim in the page is supported by the
     business's REAL data. Returns (ok, "unsupported claim; unsupported claim").
 
     This is the check the design `critique()` structurally cannot do — the critique
     never sees the source facts, so invention (fake amenities, superlatives, wrong
     day-counts, laundered quotes) slips past it. Cheap Haiku-class, text-only.
+
+    `site_facts` (their real, strictly-sourced services from their own website) is
+    folded into VERIFIED DATA so the checker treats those named services as supported
+    — otherwise it would flag the very specificity we just added as "unsupported".
     """
     if not config.ANTHROPIC_API_KEY:
         return True, ""
     if costs.check(conn, "claude", FACT_CHECK_USD) == "block":
         return True, ""  # budget-blocked: don't fail the sample over the fact-check
+    site_facts = site_facts or {}
     hours = profile.get("hours") or []
     facts = {
         "name": lead["business_name"], "category": lead["category"],
@@ -863,12 +1339,13 @@ def fact_check(conn, lead, profile: dict, html: str) -> tuple[bool, str]:
         "hours": hours,
         "open_days_per_week": sum(1 for h in hours if "closed" not in h.lower()),
         "summary": profile.get("summary"),
+        "services_listed_on_their_own_website": site_facts.get("services") or None,
         "reviews_with_ratings": profile.get("reviews"),
     }
     trimmed = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html,
                      flags=re.S | re.I)[:45000]
     prompt = f"""You are fact-checking a sales sample website against the ONLY verified
-data about a real business. List every factual claim on the page that is NOT supported
+data about a real business. List every factual claim THE PAGE MAKES that is NOT supported
 by that data.
 
 FLAG: services/treatments not evidenced in the data; amenities (parking, refreshments,
@@ -885,17 +1362,26 @@ Do NOT flag generic benefit/marketing language that asserts no specific fact (e.
 "results that look like you"). Be precise and conservative — only genuine unsupported
 factual claims.
 
+CRITICAL — you are checking the PAGE, not the data:
+- Flag a claim ONLY if the PAGE HTML itself states it. For every flag you MUST copy the
+  exact words FROM THE PAGE into "page_quote" (verbatim, at least a few words). If you
+  cannot copy the claim from the PAGE HTML, it is not on the page — do NOT flag it.
+- The customer reviews inside VERIFIED DATA are customer-attested facts, NOT page claims.
+  NEVER flag something merely because it appears in a review; only flag it if the PAGE
+  presents it as the business's own claim (with a page_quote to prove it).
+
 VERIFIED DATA:
 {json.dumps(facts, indent=2)}
 
 PAGE HTML:
 {trimmed}
 
-Return STRICT JSON only: {{"ok": true|false, "unsupported": ["<claim> - <why>", ...]}}"""
+Return STRICT JSON only:
+{{"ok": true|false, "unsupported": [{{"claim": "<what>", "page_quote": "<exact words copied from the PAGE HTML>", "why": "<why unsupported>"}}]}}"""
     try:
         client = _claude()
         resp = client.messages.create(
-            model=config.MODEL_CLASSIFIER, max_tokens=600,
+            model=config.MODEL_CLASSIFIER, max_tokens=800,
             system="You are a strict, conservative fact-checker.",
             messages=[{"role": "user", "content": prompt}],
         )
@@ -907,8 +1393,34 @@ Return STRICT JSON only: {{"ok": true|false, "unsupported": ["<claim> - <why>", 
                      tokens_out=resp.usage.output_tokens)
         conn.commit()
         data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
-        unsupported = [u for u in (data.get("unsupported") or []) if u]
-        return (data.get("ok", True) and not unsupported), "; ".join(unsupported)
+        # Anchor every flag to text actually on the page: the fact-checker confabulates
+        # amenities it sees in the source REVIEWS (parking, beverage station, candy bowl)
+        # and misattributes them to the page. Drop any flag whose page_quote isn't really
+        # in the page — that filters the confabulations while keeping real on-page claims.
+        page_norm = _alnum(BeautifulSoup(html, "lxml").get_text(" ") + " " +
+                           " ".join(t.get("alt", "") + " " + t.get("aria-label", "")
+                                    for t in BeautifulSoup(html, "lxml").find_all()))
+        kept, dropped = [], []
+        for u in (data.get("unsupported") or []):
+            if isinstance(u, str):
+                # legacy string form — keep (no quote to verify against)
+                if u.strip():
+                    kept.append(u.strip())
+                continue
+            if not isinstance(u, dict):
+                continue
+            claim = (u.get("claim") or "").strip()
+            quote = (u.get("page_quote") or "").strip()
+            why = (u.get("why") or "").strip()
+            q_norm = _alnum(quote)
+            if q_norm and len(q_norm) >= 6 and q_norm in page_norm:
+                kept.append(f"{claim} - {why}" if why else claim)
+            else:
+                dropped.append(f"{claim} (quote not on page: {quote!r})")
+        if dropped:
+            log.info("fact_check dropped %d confabulated flag(s): %s",
+                     len(dropped), "; ".join(dropped)[:300])
+        return (not kept), "; ".join(kept)
     except (AttributeError, json.JSONDecodeError):
         log.warning("fact_check unparseable response; passing by default")
         return True, ""
@@ -917,19 +1429,64 @@ Return STRICT JSON only: {{"ok": true|false, "unsupported": ["<claim> - <why>", 
         return True, ""
 
 
+def _core_brand(name: str) -> str:
+    """Brand portion of a listing name, dropping a parenthetical location and any
+    provider/credential suffix ("Syringe Aesthetics - Manuel Guillen, FNP" ->
+    "Syringe Aesthetics"; "I Love My Look Aesthetics (Viridian, Arlington Location)"
+    -> "I Love My Look Aesthetics"). The generator correctly brands to this, so the
+    gate must too."""
+    name = re.sub(r"\s*\([^)]*\)", "", name).strip()  # drop "(Viridian, ...)"
+    return re.split(r"\s+[-–—|]\s+|,\s*", name, maxsplit=1)[0].strip()
+
+
+_GENERIC_BRAND_WORDS = {
+    "med", "medspa", "spa", "spas", "aesthetic", "aesthetics", "salon", "clinic",
+    "wellness", "school", "llc", "inc", "co", "the", "and", "of", "skin", "beauty",
+    "studio", "center", "centre", "institute", "bar", "lounge", "medical", "cosmetic",
+    "cosmetics", "laser", "day", "group", "care", "health",
+}
+
+
+def _brand_present(name: str, page_lower: str) -> bool:
+    """True if the page carries the business's brand. Matches on the DISTINCTIVE lead
+    words (ignoring generic 'med spa / aesthetics / ...' descriptors), with &<->and
+    normalized, so a page that brands itself "Fit & Fancy" satisfies the listing
+    "Fit & Fancy Med Spa & School" instead of triggering a false 'name missing' retry."""
+    def toks(s: str) -> list[str]:
+        return [t for t in re.split(r"[^a-z0-9]+", s.lower().replace("&", " and ")) if t]
+    page = set(toks(page_lower))
+    distinctive = [t for t in toks(_core_brand(name))
+                   if t not in _GENERIC_BRAND_WORDS and len(t) > 1]
+    if distinctive:
+        return all(t in page for t in distinctive[:2])  # first two lead words suffice
+    # entirely-generic brand (e.g. "MedSpa") — fall back to the joined core string
+    return "".join(toks(_core_brand(name))) in re.sub(r"[^a-z0-9]", "", page_lower)
+
+
 def structural_gate(html: str, lead, images: list[str],
                     source_text: str = "") -> str | None:
     """Doc 01 STEP 3 hard-defect gate. Returns None if OK, else the failure."""
     lower = html.lower()
-    if lead["business_name"].lower() not in lower:
+    if not _brand_present(lead["business_name"], lower):
         return "business name missing"
     if "lorem ipsum" in lower or "placeholder" in lower:
         return "placeholder text present"
-    if "<meta name=\"viewport\"" not in lower and "<meta name='viewport'" not in lower:
+    if not re.search(r"<meta\b[^>]*\bname\s*=\s*[\"']viewport[\"']", lower):
         return "no viewport meta"
-    for section in ("hero", "service", "contact"):
-        if section not in lower:
-            return f"missing {section} section"
+    # Check for real signals, not magic words — a good page that titles its sections
+    # "Get in Touch" or "Our Treatments" must NOT be falsely rejected into a slow retry.
+    if "<h1" not in lower:
+        return "no <h1> headline (hero)"
+    if not any(s in lower for s in
+               ("service", "treatment", "what we offer", "our menu", "procedure", "offering")):
+        return "missing services section"
+    phone_digits = re.sub(r"\D", "", lead["phone"] or "")
+    page_digits = re.sub(r"\D", "", lower)
+    has_phone = len(phone_digits) >= 7 and phone_digits[-7:] in page_digits
+    if not has_phone and not any(s in lower for s in
+            ("contact", "get in touch", "visit us", "book", "appointment", "call us",
+             "find us", "location", "reach us")):
+        return "missing contact section"
     srcs = re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I)
     for src in srcs:
         if src.startswith("data:"):
@@ -938,12 +1495,10 @@ def structural_gate(html: str, lead, images: list[str],
             return f"invented image URL: {src[:80]}"
     if images and not srcs:
         return "good real photo available but page fell back to no images"
-    # unsourced superlatives / invented claims (checks alt text + overlays too, since
-    # this scans raw HTML — that's where "best in Plano" hid on lead 60)
-    src = (source_text or "").lower()
-    hits = sorted({b.strip() for b in BANNED_CLAIMS if b in lower and b not in src})
-    if hits:
-        return "unsourced claim(s): " + ", ".join(hits)
+    # NOTE: unsourced superlatives are no longer a hard gate failure — they are scrubbed
+    # deterministically in build_one (_scrub_superlatives) BEFORE this gate, so they can
+    # never kill a lead (leads 214/234 died here on "best"/"#1"). Invented amenities /
+    # credentials are caught by fact_check + degrade-not-die, not by a fatal gate.
     try:
         BeautifulSoup(html, "lxml")
     except Exception:
@@ -972,13 +1527,20 @@ def build_one(conn, lead) -> bool:
     if brand:
         log.info("lead %s brand: colors=%s fonts=%s logo=%s", lead["id"],
                  brand.get("colors"), brand.get("fonts"), bool(brand.get("logo")))
+    # their REAL services + tagline from their own site — the substance that lets the
+    # copy be specific instead of generic mood-filler (strictly sourced; cached per-URL)
+    site_facts = (extract_site_facts(conn, lead, lead["existing_website"])
+                  if lead["existing_website"] else {})
     # the real logo is a legitimate image even if it isn't in the photo `images`
     allowed_images = images + ([brand["logo"]] if brand.get("logo") else [])
     # everything we can truthfully say about them — the claim gate allows a banned
-    # word only if it appears here (e.g. a review literally saying "best place")
+    # word only if it appears here (e.g. a review literally saying "best place");
+    # their real services/tagline are sourced facts, so include them here too.
     source_text = " ".join([
         lead["business_name"] or "", lead["category"] or "",
         profile.get("summary") or "",
+        *(site_facts.get("services") or []),
+        site_facts.get("tagline") or "",
         *[r.get("text", "") for r in (profile.get("reviews") or [])],
     ])
 
@@ -987,18 +1549,35 @@ def build_one(conn, lead) -> bool:
     if style_ctx:
         system += "\n\n" + style_ctx
 
-    base_prompt = build_prompt(lead, brief, archetype, images, profile, brand,
-                               image_source, image_notes)
+    # FACTS IN CODE: assemble every verifiable fact (name, rating line, hours,
+    # phone, address, verbatim 4-5★ testimonials) here so the generator places them
+    # unmodified and can only invent inside its own marketing prose — which the
+    # fact-check + banned-claim gate then police. This is what stops the churn:
+    # attempt 1 is honest by construction, so retries become the exception.
+    content = assemble_content_blocks(lead, profile, site_facts)
+    # rotate a distinct design language per lead so samples stop looking templated.
+    # hash the id (not id % N) so consecutive/clustered ids still spread evenly.
+    dl_idx = int(hashlib.sha1(str(lead["id"]).encode()).hexdigest(), 16) % len(DESIGN_LANGUAGES)
+    design_language = DESIGN_LANGUAGES[dl_idx]
+    log.info("lead %s design language: %s", lead["id"], design_language["name"])
+    base_prompt = build_prompt(lead, brief, archetype, images, content, brand,
+                               image_source, image_notes, design_language)
     feedback: list[str] = []
     html, failure = None, "no attempts made"
+    last_valid, last_flags = None, ""   # best gate-passed candidate + its residual flags
     critiqued = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        final_attempt = attempt == MAX_ATTEMPTS
         raw = _call_claude(conn, system, (base_prompt, "\n\n".join(feedback)),
                            lead["id"], f"sample_generate_a{attempt}")
         if raw is None:
             failure = "claude budget blocked"
             break
         candidate = extract_html(raw)
+        # deterministically remove unsourced ranking superlatives BEFORE the gate — the
+        # model keeps writing "best"/"#1" no matter the prompt ban, and failing the gate
+        # on them just burns a retry (or kills the lead). Scrubbing keeps the page honest.
+        candidate = _scrub_superlatives(candidate, source_text)
         failure = structural_gate(candidate, lead, allowed_images, source_text)
         if failure:
             log.info("lead %s attempt %s failed gate: %s", lead["id"], attempt, failure)
@@ -1008,23 +1587,25 @@ def build_one(conn, lead) -> bool:
                 "services, why-choose-us, testimonials, hours/location, contact CTA) "
                 "and the images; fix only what's named, never drop anything else.")
             continue
-        # grounding fact-check — reject any invented claim before design polish
-        fact_ok, fact_fixes = fact_check(conn, lead, profile, candidate)
+        # grounding fact-check — the facts are code-locked, so anything flagged here
+        # is invention inside the model's own prose (an amenity, a superlative).
+        fact_ok, fact_fixes = fact_check(conn, lead, profile, candidate, site_facts)
         if not fact_ok and fact_fixes:
             log.info("lead %s attempt %s fact-check flagged: %s",
                      lead["id"], attempt, fact_fixes[:200])
+            last_valid, last_flags = candidate, fact_fixes  # honest scaffold, prose slip
             feedback.append(
-                "FACT-CHECK — these claims are NOT supported by the business's "
-                "real data. Remove or rewrite each so the page states only "
-                "verified facts:\n" + fact_fixes +
-                "\nRegenerate the COMPLETE page with ALL required sections and "
-                "the images — change only the flagged claims, drop nothing else.")
-            html = candidate  # fallback if later attempts regress
+                "FACT-CHECK — your marketing copy stated these claims, which are NOT in "
+                "LOCKED CONTENT and are therefore forbidden. DELETE each one outright "
+                "(do not soften or reword — remove the phrase/sentence):\n" + fact_fixes +
+                "\nRegenerate the COMPLETE page with ALL required sections and the images "
+                "— remove only the flagged claims, keep every LOCKED CONTENT item exactly.")
+            failure = "fact-check unresolved: " + fact_fixes[:140]
             continue
-        # one critique-driven refine per lead: on FAIL it's mandatory, and a
-        # PASS with any core factor at 4 ("fine, forgettable") earns the same
-        # single polish pass — the cached base prompt makes the retry cheap
-        if not critiqued and attempt < MAX_ATTEMPTS:
+        # one critique-driven refine per lead (skipped on the final attempt, which has
+        # no budget left to act on it): FAIL is mandatory, a PASS with any core factor
+        # at 4 ("fine, forgettable") earns the same single polish pass.
+        if not critiqued and not final_attempt:
             critiqued = True
             ok, fixes, weak = critique(conn, lead, candidate, image_source)
             if fixes and (not ok or weak):
@@ -1041,6 +1622,17 @@ def build_one(conn, lead) -> bool:
         failure = None
         break
 
+    # degrade-not-die: if no attempt came back fact-clean but we have a structurally
+    # sound candidate, ship it flagged (its facts are code-assembled and honest; the
+    # residual is a prose slip for factor-F grading to catch) rather than killing the
+    # lead. Two builds already spent — a dead lead is the worst outcome.
+    fact_flag_note = None
+    if html is None and SHIP_WHEN_FACT_FLAGGED and last_valid is not None:
+        html = last_valid
+        fact_flag_note = "fact_flagged: " + last_flags[:180]
+        log.warning("lead %s: shipping fact-flagged sample for review — %s",
+                    lead["id"], last_flags[:200])
+
     if html is None:
         db.transition(conn, lead["id"], "SAMPLE_FAILED", failure or "unknown")
         conn.commit()
@@ -1051,16 +1643,21 @@ def build_one(conn, lead) -> bool:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "index.html").write_text(html, encoding="utf-8")
 
+    # remember which stock photos this sample actually placed, so the next build
+    # picks different ones (no repeated stock across samples)
+    if image_source == "stock":
+        remember_stock(re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I))
+
     url = f"{config.SAMPLE_BASE_URL}/{slug}"
-    notes = None
+    notes = fact_flag_note
     try:
         r = requests.get(url, timeout=15)
         if r.status_code != 200:
-            notes = f"url_unverified ({r.status_code})"
+            notes = f"{notes + '; ' if notes else ''}url_unverified ({r.status_code})"
     except requests.RequestException:
-        notes = "url_unverified (tunnel unreachable at build time)"
+        notes = f"{notes + '; ' if notes else ''}url_unverified (tunnel unreachable at build time)"
     if notes:
-        log.warning("lead %s: %s — check serve_samples + tunnel", lead["id"], notes)
+        log.warning("lead %s: %s", lead["id"], notes)
 
     db.transition(conn, lead["id"], "SAMPLE_BUILT", f"images={image_source}",
                   sample_url=url, sample_slug=slug, sample_built_at=db.now(),

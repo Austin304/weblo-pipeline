@@ -63,7 +63,14 @@ def _screenshots(target: str) -> list[tuple[str, bytes]]:
             for label, w, h, full in (("desktop fold", 1280, 900, False),
                                       ("mobile fold", 390, 844, False),
                                       ("desktop full page", 1280, 900, True)):
-                page = browser.new_page(viewport={"width": w, "height": h})
+                # reduced_motion=reduce: our pages use scroll-reveal (.reveal starts
+                # at opacity:0, IntersectionObserver fades it in on scroll). A headless
+                # full-page screenshot never scrolls, so without this the grader captures
+                # every reveal section still invisible ("empty colored blocks") and grades
+                # blanks. The prompt mandates a prefers-reduced-motion override
+                # (.reveal{opacity:1}), so reducing motion shows the real, settled page.
+                page = browser.new_page(viewport={"width": w, "height": h},
+                                        reduced_motion="reduce")
                 page.goto(target, wait_until="networkidle", timeout=45_000)
                 page.wait_for_timeout(1_200)  # let fonts/images settle
                 kwargs = {"type": "jpeg", "quality": 60}
