@@ -7,4 +7,5 @@ the closing line. Prove an edge here before risking a cent.
 Entry point: `python -m betting_sim.cli demo`
 """
 
-__all__ = ["oddsmath", "models", "grader", "portfolio", "synth", "backtest"]
+__all__ = ["oddsmath", "models", "grader", "portfolio", "synth", "backtest",
+           "lineshop", "oddsapi"]

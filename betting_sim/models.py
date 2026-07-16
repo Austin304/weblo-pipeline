@@ -15,6 +15,30 @@ class MarketPrice:
     """One side's price at one moment, in decimal odds."""
     selection: str          # e.g. "home", "away", team name
     decimal: float
+    book: Optional[str] = None   # which sportsbook this price came from
+
+
+@dataclass
+class BookQuote:
+    """One sportsbook's two-way market for a game at one moment."""
+    book: str
+    home_decimal: float
+    away_decimal: float
+
+
+@dataclass
+class ArbOpportunity:
+    """A guaranteed-profit split when the best price on each side sums < 100%."""
+    game_id: str
+    home_book: str
+    home_decimal: float
+    away_book: str
+    away_decimal: float
+    implied_sum: float       # 1/home_dec + 1/away_dec; < 1.0 means arb exists
+    profit_margin: float     # guaranteed return per unit staked, minus 1
+    stake_home: float        # split of a 1-unit total that equalises payouts
+    stake_away: float
+    guaranteed_profit: float  # profit on 1 unit total staked, either outcome
 
 
 @dataclass
@@ -32,6 +56,7 @@ class Snapshot:
     away_price: MarketPrice
     minutes_left: Optional[float] = None   # game minutes remaining
     lead: Optional[float] = None           # home margin (negative = away ahead)
+    book_quotes: list["BookQuote"] = field(default_factory=list)  # all books, for shopping
 
 
 @dataclass
