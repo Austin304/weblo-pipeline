@@ -14,11 +14,14 @@ sportsbook to learn the answer.*
 
 ```bash
 python -m betting_sim.cli demo            # strategy comparison: why 'safe' loses
-python -m betting_sim.cli shop            # line shopping & arbitrage across books
+python -m betting_sim.cli shop            # line shopping & arbitrage (synthetic)
+python -m betting_sim.cli realtest        # backtest on REAL free historical odds
 python -m betting_sim.cli grade           # grade one example market
-python -m betting_sim.tests.test_oddsmath # the money-math tests
-python -m betting_sim.tests.test_lineshop # the line-shopping / arb tests
+python -m betting_sim.tests.test_oddsmath # money-math tests (+ test_lineshop, test_realdata)
 ```
+
+The `demo`/`shop`/`grade` commands use synthetic data (known ground truth, for
+testing the strategy logic). `realtest` uses **real** historical odds — see below.
 
 ## What the demo shows
 
@@ -96,6 +99,48 @@ never clears as a standalone +EV play. Real soft-book value comes from **stale
 or slow-moving lines** (a book late to update after news/an injury), not from a
 clean snapshot — so this sim deliberately doesn't manufacture it.
 
+## Real historical data (`python -m betting_sim.cli realtest`)
+
+No paid API needed. This pulls free CSVs from **football-data.co.uk**, which
+publish, per match: the result plus decimal odds from 6 books (Bet365, Betway,
+Interwetten, Pinnacle, William Hill, VC), both opening and closing. Real
+multi-book prices + real closing lines + real outcomes.
+
+```bash
+python -m betting_sim.cli realtest                       # 4 EPL seasons (downloads)
+python -m betting_sim.cli realtest --div SP1 --seasons 2324,2223   # La Liga
+python -m betting_sim.cli realtest --csv path/to/E0.csv  # offline, local file
+```
+
+What 1,520 real EPL matches (2020–2024) actually showed:
+
+| | at one book (Bet365) | shop best of 6 |
+|---|---|---|
+| flat-stake favorites ROI | **−1.44%** | **+1.44%** |
+| avg CLV vs Pinnacle close | −0.029 | −0.014 |
+
+Two real findings, straight from real games:
+
+1. **Line shopping is worth ~+2.9 points of ROI, for real** — enough here to
+   flip blindly-betting-favorites from a −1.4% loss to a +1.4% "profit". That's
+   the free money in always taking the best price.
+2. **But don't get excited.** Even the best-line version still has *negative*
+   CLV (−0.014) — it isn't truly beating the sharp closing line, so that small
+   positive ROI is more likely variance than a real edge. Real proof of an edge
+   is *positive CLV*, and flat-favorite betting doesn't have it. Line shopping
+   recovers the vig; it doesn't manufacture an edge.
+
+The favorite-longshot bias is visible too: over the same matches, blindly
+betting favorites (−1.4%) beats blindly betting longshots (−4.8%) — soccer
+bettors overpay for underdogs. And 3-way arbitrage across the six books appears
+in ~0.8% of matches at ~0.8% margin: real, rare, and small.
+
+**Honest limit:** these are PRE-MATCH odds. They validate the market's pricing,
+line-shopping value, and closing-line value for real — but they can't replay the
+exact "bet the safe favorite in the 88th minute" spot, which needs in-game odds
+history (paid/rare). The lesson transfers; the specific late-game numbers would
+need live data.
+
 ## How the pieces fit
 
 ```
@@ -122,8 +167,10 @@ portfolio.py  SQLite paper bankroll → ROI, win rate, CLV, max drawdown
   `make_multibook_games` prices each game across several books for shopping.
 - **`lineshop.py`** — best-line selection, sharp multi-book consensus, and
   arbitrage detection/sizing. The retail-edge toolkit.
-- **`oddsapi.py`** — *optional* adapter for real current odds from The Odds API
-  (needs `ODDS_API_KEY`; historical odds for a real backtest are a paid tier).
+- **`realdata.py`** — loads free real historical odds from football-data.co.uk
+  (multi-book, opening + closing, with results). Powers `realtest`. No key.
+- **`oddsapi.py`** — *optional* adapter for real *current* odds from The Odds API
+  (needs `ODDS_API_KEY`; free tier = live odds for `cli live`/`sports`).
 
 ## Where a real edge would come from (and the walls)
 

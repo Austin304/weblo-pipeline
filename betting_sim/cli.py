@@ -145,6 +145,113 @@ def cmd_shop(args: argparse.Namespace) -> None:
     print("difference between a slow loss and a slow win.\n")
 
 
+def _fav_backtest(matches, pricing: str):
+    """Flat-stake the market favorite each match, priced at `pricing`
+    ('best' = best line across books, else a book name). Returns a dict of
+    n, wins, roi, win_rate, avg_clv, net — CLV vs de-vigged Pinnacle close."""
+    from . import realdata
+    n = wins = 0
+    staked = net = 0.0
+    clvs = []
+    for m in matches:
+        fav = realdata.favorite(m)
+        if pricing == "best":
+            price, _ = realdata.best_price(m, fav)
+        else:
+            odds = m.open_odds.get(pricing)
+            if not odds:
+                continue
+            price = odds[fav]
+        if price <= 1.0:
+            continue
+        won = m.result == fav
+        net += (price - 1.0) if won else -1.0
+        staked += 1.0
+        n += 1
+        wins += int(won)
+        fair_close = realdata.pinnacle_fair_close(m)
+        if fair_close:
+            clvs.append(fair_close[fav] - 1.0 / price)
+    return {
+        "n": n, "wins": wins,
+        "roi": net / staked if staked else 0.0,
+        "win_rate": wins / n if n else 0.0,
+        "avg_clv": sum(clvs) / len(clvs) if clvs else 0.0,
+        "net": net,
+    }
+
+
+def cmd_realtest(args: argparse.Namespace) -> None:
+    from . import realdata
+    matches = []
+    try:
+        if args.csv:
+            for path in args.csv:
+                matches += realdata.load(path)
+            src_desc = ", ".join(args.csv)
+        else:
+            seasons = args.seasons.split(",")
+            for s in seasons:
+                url = realdata.season_url(s.strip(), args.div)
+                got = realdata.load(url)
+                matches += got
+                print(f"  loaded {len(got):4} matches  {args.div} {s.strip()}")
+            src_desc = f"{args.div} seasons {args.seasons}"
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not load real data: {e}\n")
+        return
+    if not matches:
+        print("\nno matches loaded.\n")
+        return
+
+    print(f"\nREAL DATA: {len(matches)} matches ({src_desc}), "
+          f"{len(realdata.BOOKS)} books, real closing lines & results.\n")
+
+    # 1) Betting favorites for real + the line-shopping benefit
+    single = _fav_backtest(matches, args.book)
+    best = _fav_backtest(matches, "best")
+    print("1) Flat-stake the market favorite every match (real results)")
+    print(f"   at {args.book:12}: win {single['win_rate']:.1%}  "
+          f"ROI {single['roi']:+.2%}  CLV {single['avg_clv']:+.3f}  "
+          f"({single['n']} bets, net {single['net']:+.1f}u)")
+    print(f"   shop best line : win {best['win_rate']:.1%}  "
+          f"ROI {best['roi']:+.2%}  CLV {best['avg_clv']:+.3f}  "
+          f"({best['n']} bets, net {best['net']:+.1f}u)")
+    print(f"   -> line shopping is worth {(best['roi'] - single['roi']) * 100:+.2f} "
+          f"pts of ROI and {best['avg_clv'] - single['avg_clv']:+.3f} CLV, real.\n")
+
+    # 2) Favorite-longshot bias, measured for real
+    fav_roi = single["roi"]
+    dog_net = dog_stake = 0.0
+    for m in matches:
+        dog = max(realdata.OUTCOMES,
+                  key=lambda oc: sum(o[oc] for o in m.open_odds.values()))
+        odds = m.open_odds.get(args.book)
+        if not odds:
+            continue
+        price = odds[dog]
+        dog_net += (price - 1.0) if m.result == dog else -1.0
+        dog_stake += 1.0
+    dog_roi = dog_net / dog_stake if dog_stake else 0.0
+    print("2) Favorite-longshot bias (flat 1u, real results)")
+    print(f"   betting favorites: ROI {fav_roi:+.2%}")
+    print(f"   betting longshots: ROI {dog_roi:+.2%}")
+    print("   (both usually negative — the vig taxes every side. the gap is the "
+          "bias.)\n")
+
+    # 3) Arbitrage across the real books
+    arbs = [(m, a) for m in matches if (a := realdata.find_arbitrage(m))]
+    print("3) Arbitrage scan across the real books (3-way)")
+    if arbs:
+        print(f"   found {len(arbs)} in {len(matches)} matches "
+              f"({len(arbs) / len(matches):.1%}); "
+              f"avg margin {sum(a for _, a in arbs) / len(arbs):+.2%}")
+    else:
+        print(f"   none in {len(matches)} matches — expected: these books are "
+              "sharp and this is pre-match, not a fast-moving live line.")
+    print("\n  All real prices, real outcomes. No bets placed — read only.\n")
+
+
 def cmd_sports(args: argparse.Namespace) -> None:
     from . import oddsapi
     try:
@@ -217,6 +324,18 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    rt = sub.add_parser("realtest",
+                        help="backtest on REAL free historical odds (no key)")
+    rt.add_argument("--seasons", default="2324,2223,2122,2021",
+                    help="comma-separated season codes, e.g. 2324,2223")
+    rt.add_argument("--div", default="E0",
+                    help="league: E0=EPL, SP1=La Liga, D1=Bundesliga, I1=Serie A")
+    rt.add_argument("--csv", nargs="*",
+                    help="local CSV path(s) instead of downloading")
+    rt.add_argument("--book", default="Bet365",
+                    help="single book to compare against best-line shopping")
+    rt.set_defaults(func=cmd_realtest)
 
     sp = sub.add_parser("sports", help="list real sport keys (needs ODDS_API_KEY)")
     sp.add_argument("--key", default=None, help="Odds API key (or set ODDS_API_KEY)")
