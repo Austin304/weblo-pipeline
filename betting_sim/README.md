@@ -139,6 +139,48 @@ drifts to zero; with a −EV bet it gets there faster. The only thing that makes
 *small* fraction (quarter-Kelly) compounds it safely. Edge is the whole game;
 bankroll growth is just what a real edge does on its own.
 
+## Autonomous mode: scan everything, forecast, learn (`cli autopilot`)
+
+The full loop, hands-free: scan every market → triage what's worth forecasting →
+forecast it → paper-bet the disagreements → resolve → learn → repeat. Paper bets
+are free, so it can run forever and keep improving.
+
+**The one cost that isn't free:** forecasting. Pulling markets is free API calls,
+but running an LLM + web search on each costs tokens, and there are thousands of
+markets. So the system *triages* first (`scanner.py`) and spends the forecasting
+budget only where edge is plausible.
+
+```bash
+python -m betting_sim.cli scan                 # rank ALL markets by priority (free)
+python -m betting_sim.cli autopilot --dry-run  # show what it would forecast (free)
+python -m betting_sim.cli autopilot --budget 20  # forecast + log (needs API key)
+python -m betting_sim.cli learn                # what it has learned so far
+```
+
+The pieces:
+
+- **`scanner.py`** — pulls every active market, tags a category, and scores each
+  by priority: **skips near-certain markets** (no edge room), **requires
+  liquidity** (an unbettable edge is worthless), **prefers fast resolution**
+  (faster learning). A live scan just now: 405 markets → 123 clear the filters,
+  ranked so the forecaster hits the best ones first. That's how you "investigate
+  all bets" without paying to research thousands of dead ones.
+- **`autopilot`** — walks the ranked list, forecasts each with `llmforecast`,
+  applies the learned calibration correction, and logs paper bets on
+  disagreements. `--dry-run` does the free triage; the live run needs your key.
+- **`learn.py`** — the improvement engine. You can't fine-tune the LLM from a few
+  outcomes, but you *can*: (1) track **skill/ROI by category** (bet more where it
+  works, stop where it doesn't); (2) **fix miscalibration** with Platt scaling
+  (if its 70%s hit 60%, correct future forecasts); (3) surface its **biggest
+  misses** for few-shot feedback. Every estimate is gated on sample size — below
+  ~20 resolved it refuses to conclude, because that's just noise.
+
+**The honest expectation:** scanning everything mostly finds *no* edge — the
+market already priced the news. The system's real job is to (a) discover that
+truth cheaply, and (b) surface the rare pockets where edge might exist, then
+prove them out-of-sample. It's built to accept "no edge" as an answer, not to
+manufacture bets.
+
 ## Let it learn: the paper-trading ledger (`cli paper`)
 
 This is the live experiment — does an LLM+web-search forecaster actually beat the

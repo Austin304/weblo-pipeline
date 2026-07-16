@@ -9,4 +9,5 @@ Entry point: `python -m betting_sim.cli demo`
 
 __all__ = ["oddsmath", "models", "grader", "portfolio", "synth", "backtest",
            "lineshop", "oddsapi", "realdata", "bankroll", "polymarket",
-           "forecast", "kalshi", "llmforecast", "paperlog"]
+           "forecast", "kalshi", "llmforecast", "paperlog",
+           "scanner", "learn"]

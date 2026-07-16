@@ -252,6 +252,114 @@ def cmd_realtest(args: argparse.Namespace) -> None:
     print("\n  All real prices, real outcomes. No bets placed — read only.\n")
 
 
+def cmd_scan(args: argparse.Namespace) -> None:
+    from . import scanner
+    try:
+        cands = scanner.scan(max_markets=args.scan)
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not scan: {e}\n")
+        return
+    worth = scanner.worth_forecasting(cands, args.budget)
+    cats: dict[str, int] = {}
+    for c in cands:
+        cats[c.category] = cats.get(c.category, 0) + 1
+    print(f"\nScanned {len(cands)} active markets. "
+          f"{sum(1 for c in cands if c.priority > 0)} clear the filters "
+          f"(liquid, not near-certain).")
+    print("  by category: " + ", ".join(f"{k}={v}" for k, v in
+                                         sorted(cats.items(), key=lambda x: -x[1])))
+    print(f"\nTop {min(args.budget, len(worth))} worth forecasting first "
+          "(priority = liquidity x time-to-resolve):\n")
+    for c in worth[:args.budget]:
+        print(f"  [{c.priority:.2f}] {c.category:11} yes {c.yes_price:.2f}  "
+              f"liq ${c.liquidity:,.0f}  {c.question[:46]}")
+    print("\n  This is the free triage. A forecaster works down this list until")
+    print("  the token budget runs out — that's how you 'scan everything' without")
+    print("  paying to research thousands of dead markets.\n")
+
+
+def cmd_learn(args: argparse.Namespace) -> None:
+    from . import learn, paperlog as pl
+    data = pl.load()
+    resolved = [b for b in data["bets"] if b["status"] == "resolved"]
+    print(f"\nLearning from {len(resolved)} resolved paper bets "
+          f"(need >= {learn.MIN_SAMPLE} for real conclusions).\n")
+    if not resolved:
+        print("  Nothing resolved yet — no learning possible. Come back after the")
+        print("  paper bets settle. (Run `paper --resolve` to settle closed ones.)\n")
+        return
+
+    print("Edge by category:")
+    for cat, r in learn.by_category(data).items():
+        flag = "" if r["enough"] else "  (too few — noise)"
+        print(f"  {cat:12} n={r['n']:3}  skill {r['skill']:+.3f}  "
+              f"ROI {r['roi']:+.1%}{flag}")
+
+    a, b, trust = learn.fit_calibration(data)
+    print(f"\nCalibration correction (Platt): a={a}, b={b}  "
+          f"{'ACTIVE' if trust else '(inactive — not enough data)'}")
+
+    print("\nFocus recommendations:")
+    for line in learn.focus(data):
+        print(f"  - {line}")
+
+    misses = learn.biggest_misses(data)
+    if misses:
+        print("\nBiggest misses (feed back as lessons):")
+        for m in misses:
+            print(f"  said {m['model_prob']:.2f}, outcome {m['outcome']}  "
+                  f"{m['question'][:48]}")
+    print()
+
+
+def cmd_autopilot(args: argparse.Namespace) -> None:
+    from . import scanner, learn, paperlog as pl
+    try:
+        cands = scanner.scan(max_markets=args.scan)
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not scan: {e}\n")
+        return
+    worth = scanner.worth_forecasting(cands, args.budget)
+    print(f"\nAutopilot: scanned {len(cands)} markets, "
+          f"{len(worth)} worth forecasting (budget {args.budget}).")
+
+    if args.dry_run:
+        print("DRY RUN — showing what it WOULD forecast (no tokens spent):\n")
+        for c in worth:
+            print(f"  [{c.priority:.2f}] {c.category:11} mkt {c.yes_price:.2f}  "
+                  f"{c.question[:50]}")
+        print("\n  Drop --dry-run (with an API key set) to actually forecast "
+              "these\n  and log paper bets on the disagreements.\n")
+        return
+
+    from . import llmforecast
+    data = pl.load()
+    a, b, trust = learn.fit_calibration(data)
+    if trust:
+        print(f"  applying learned calibration correction (a={a}, b={b})")
+    logged = bets = 0
+    for c in worth:
+        try:
+            prob, rationale = llmforecast.forecast(c.question, api_key=args.key)
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! forecast failed ({str(e)[:50]}) — {c.question[:36]}")
+            continue
+        if trust:
+            prob = round(learn.apply_correction(prob, a, b), 4)
+        rec = pl.add_forecast(
+            data, platform=c.platform, market_id=c.market_id, slug=c.slug,
+            question=c.question, close_date=c.close_date, model_prob=prob,
+            market_prob=c.yes_price, rationale=rationale,
+            edge_threshold=args.edge_threshold)
+        logged += 1
+        bets += int(rec["side"] != "none")
+        print(f"  {rec['side']:4} model {prob:.2f} vs {c.yes_price:.2f}  "
+              f"{c.question[:44]}")
+    pl.save(data)
+    print(f"\nlogged {logged} forecasts, {bets} paper bets. Run "
+          "`paper --resolve` after they close, then `learn`.\n")
+
+
 def cmd_paper(args: argparse.Namespace) -> None:
     from . import paperlog as pl
     data = pl.load()
@@ -549,6 +657,24 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    scn = sub.add_parser("scan", help="scan ALL markets and rank what's worth forecasting")
+    scn.add_argument("--scan", type=int, default=1000, help="max markets to pull")
+    scn.add_argument("--budget", type=int, default=25, help="how many top markets to show")
+    scn.set_defaults(func=cmd_scan)
+
+    au = sub.add_parser("autopilot",
+                        help="scan -> prioritize -> forecast -> log paper bets (autonomous)")
+    au.add_argument("--scan", type=int, default=1000)
+    au.add_argument("--budget", type=int, default=20, help="max markets to forecast")
+    au.add_argument("--dry-run", action="store_true",
+                    help="show what it would forecast without spending tokens")
+    au.add_argument("--edge-threshold", type=float, default=0.05)
+    au.add_argument("--key", default=None, help="Anthropic API key (or env)")
+    au.set_defaults(func=cmd_autopilot)
+
+    ln = sub.add_parser("learn", help="learn from resolved paper bets: edge by category, calibration")
+    ln.set_defaults(func=cmd_learn)
 
     pa = sub.add_parser("paper",
                         help="paper-trading ledger: log forecasts, resolve, score")
