@@ -252,6 +252,65 @@ def cmd_realtest(args: argparse.Namespace) -> None:
     print("\n  All real prices, real outcomes. No bets placed — read only.\n")
 
 
+def cmd_pm(args: argparse.Namespace) -> None:
+    from . import polymarket
+    try:
+        markets = polymarket.fetch_markets(limit=args.limit)
+        event = polymarket.fetch_top_event()
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not reach Polymarket: {e}\n")
+        return
+    print(f"\nLIVE Polymarket data — {len(markets)} active markets "
+          "(public API, read only).\n")
+
+    # 1) The drag reality: spread vs a sportsbook's vig
+    spread, n = polymarket.median_spread(markets)
+    print("1) Cost to trade (the drag)")
+    if spread is not None:
+        print(f"   median bid/ask spread on {n} liquid markets: "
+              f"{spread * 100:.2f}c")
+        print(f"   for contrast, a sportsbook's vig is ~4.5%. Far lower drag "
+              "here — and no one limits you for winning.\n")
+    else:
+        print("   (no liquid markets found right now)\n")
+
+    # 2) The 'safe bet' trap, live
+    traps = polymarket.safe_bet_traps(markets, threshold=args.safe_threshold)
+    print(f"2) 'Safe bet' spots priced above {args.safe_threshold:.0%} (live)")
+    if traps:
+        for t in traps[:6]:
+            print(f"   {t['side']:3} @ {t['price']:.3f}  risk ${t['risk_to_win_1']}"
+                  f" to win $1  (needs {t['required_winrate']:.1%} just to break "
+                  f"even)  — {t['question'][:44]}")
+        print("   On a ~zero-fee exchange these are roughly BREAK-EVEN, not")
+        print("   profit — the payoff is already in the price. That's exactly")
+        print("   'Case A' of `cli compound`, where the median roll still")
+        print("   shrank to ~$43. Better than a sportsbook, still not a plan.\n")
+    else:
+        print("   none that liquid right now.\n")
+
+    # 3) Multi-outcome arbitrage — with the liquidity honesty check
+    print("3) Multi-outcome coherence / arbitrage (liquidity-aware)")
+    arb = polymarket.event_arbitrage(event)
+    print(f"   event: {arb['title'][:50]}  ({arb['n_legs']} outcomes)")
+    print(f"   naive sum of all Yes asks : {arb['naive_yes_sum']}  "
+          f"(a coherent market sums to ~1.0; wild values = stale/thin legs)")
+    print(f"   {arb['n_illiquid_legs']} of {arb['n_legs']} legs are illiquid "
+          f"mirages (no real size to fill)")
+    print(f"   liquid legs only ({arb['n_liquid_legs']}): "
+          f"Yes-sum {arb['liquid_yes_sum']}  <- where you can actually trade, "
+          f"it's efficient (no arb)")
+    print("   Lesson: a real arb needs real liquidity on EVERY leg. Screen")
+    print("   prices on thin outcomes are not fills. This is the #1 way naive")
+    print("   prediction-market 'arb' scanners fool themselves.\n")
+
+    print("Bottom line: better arena than a sportsbook (tiny spread, no bans,")
+    print("real API) — but the same law holds. Safe bets are break-even at best,")
+    print("compounding can't create an edge, and apparent free money is usually")
+    print("illiquid. A REAL edge here = forecasting/arb you can prove beats the")
+    print("settle price. That's the thing worth building.\n")
+
+
 def cmd_compound(args: argparse.Namespace) -> None:
     from . import bankroll, oddsmath
     decimal = (oddsmath.american_to_decimal(args.american) if args.american
@@ -357,6 +416,13 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    pm = sub.add_parser("pm",
+                        help="live Polymarket data: spread, safe-bet traps, arbs (no key)")
+    pm.add_argument("--limit", type=int, default=100)
+    pm.add_argument("--safe-threshold", type=float, default=0.95,
+                    help="flag outcomes priced above this as 'safe bet' spots")
+    pm.set_defaults(func=cmd_pm)
 
     cp = sub.add_parser("compound",
                         help="Monte-Carlo the '$100 grows itself on favorites' plan")

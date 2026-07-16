@@ -17,6 +17,7 @@ python -m betting_sim.cli demo            # strategy comparison: why 'safe' lose
 python -m betting_sim.cli shop            # line shopping & arbitrage (synthetic)
 python -m betting_sim.cli realtest        # backtest on REAL free historical odds
 python -m betting_sim.cli compound        # can $100 grow itself on favorites?
+python -m betting_sim.cli pm              # LIVE Polymarket: spread, traps, arbs
 python -m betting_sim.cli grade           # grade one example market
 python -m betting_sim.tests.test_oddsmath # money-math tests (+ test_lineshop, test_realdata)
 ```
@@ -135,6 +136,34 @@ drifts to zero; with a −EV bet it gets there faster. The only thing that makes
 *small* fraction (quarter-Kelly) compounds it safely. Edge is the whole game;
 bankroll growth is just what a real edge does on its own.
 
+## Prediction markets: Kalshi / Polymarket (`cli pm`)
+
+Prediction-market *exchanges* fix the two things that doom sportsbook betting:
+the drag is tiny (you pay the spread, not a ~4.5% vig) and **no one limits you
+for winning** — so a real edge can actually scale. `pm` pulls **live** Polymarket
+data (public API, no key) and points our tools at it. A recent run showed:
+
+- **Drag:** median bid/ask spread ~**0.1¢** across ~98 liquid markets (vs a
+  book's ~4.5% vig). Real, and far lower.
+- **Safe-bet trap, still real:** live markets at 0.998 — risk **$499 to win $1**.
+  On a ~zero-fee exchange that's roughly *break-even*, not a guaranteed loss like
+  a sportsbook — but "break-even with a catastrophic tail" is exactly **Case A**
+  of `cli compound`, where the median bankroll still shrank to ~$43. Better
+  arena, same law.
+- **Arbitrage honesty:** a 60-outcome "World Cup Winner" event showed a naive
+  Yes-sum wildly off 1.0 — but **58 of 60 legs were illiquid mirages** (a 0.001
+  screen price you can't actually fill). The **2 genuinely liquid legs summed to
+  1.001** — i.e. where you can really trade, it's efficient (no arb). This is the
+  #1 way naive prediction-market arb scanners fool themselves, and the tool flags
+  it instead of pretending.
+
+**Why this is the one arena worth exploring:** the vig is small, winning doesn't
+get you banned, and there are real APIs to build on (Kalshi is US-regulated with
+a clean trading API; Polymarket is crypto and a legal gray area for US persons —
+start with Kalshi). The catch is unchanged: liquid markets are efficient, "safe"
+shares are break-even at best, and a real edge = **forecasting or arbitrage you
+can prove beats the settle price.** Our arb/CLV tooling transfers directly.
+
 ## Real historical data (`python -m betting_sim.cli realtest`)
 
 No paid API needed. This pulls free CSVs from **football-data.co.uk**, which
@@ -205,6 +234,10 @@ portfolio.py  SQLite paper bankroll → ROI, win rate, CLV, max drawdown
   arbitrage detection/sizing. The retail-edge toolkit.
 - **`realdata.py`** — loads free real historical odds from football-data.co.uk
   (multi-book, opening + closing, with results). Powers `realtest`. No key.
+- **`polymarket.py`** — live Polymarket data via the public Gamma API: spreads,
+  safe-bet traps, and liquidity-aware arbitrage. Powers `pm`. No key.
+- **`bankroll.py`** — Monte-Carlo of a compounding bankroll (log-growth, ruin
+  rate, median vs mean). Powers `compound`.
 - **`oddsapi.py`** — *optional* adapter for real *current* odds from The Odds API
   (needs `ODDS_API_KEY`; free tier = live odds for `cli live`/`sports`).
 
