@@ -19,6 +19,7 @@ python -m betting_sim.cli realtest        # backtest on REAL free historical odd
 python -m betting_sim.cli compound        # can $100 grow itself on favorites?
 python -m betting_sim.cli pm              # LIVE Polymarket: spread, traps, arbs
 python -m betting_sim.cli forecast        # score a model: skill, calibration, ROI
+python -m betting_sim.cli paper --resolve # the live learning ledger (paper bets)
 python -m betting_sim.cli kalshi --series KXFED   # live Kalshi markets (no key)
 python -m betting_sim.cli grade           # grade one example market
 python -m betting_sim.tests.test_oddsmath # money-math tests (+ test_lineshop, test_realdata)
@@ -137,6 +138,34 @@ drifts to zero; with a −EV bet it gets there faster. The only thing that makes
 "start small and grow it" work is a genuine edge (positive CLV) *first* — then a
 *small* fraction (quarter-Kelly) compounds it safely. Edge is the whole game;
 bankroll growth is just what a real edge does on its own.
+
+## Let it learn: the paper-trading ledger (`cli paper`)
+
+This is the live experiment — does an LLM+web-search forecaster actually beat the
+market? It's built so the learning is *honest*, with the discipline enforced by
+design (see `paperlog.py`):
+
+- Forecasts are logged **with a date, before the outcome exists**, in a JSON
+  ledger (`paperbets.json`) committed to git. The commit history is tamper-proof
+  proof we didn't predict a settled market with hindsight.
+- **Every assessment is recorded, not just bets.** "Agreed with the market, no
+  bet" still feeds calibration.
+- Scores are computed **only on resolved markets** — strictly out-of-sample.
+- The scorecard prints the sample size and refuses to let you conclude anything
+  until N is meaningful (a handful of results is noise).
+
+```bash
+python -m betting_sim.cli paper            # show the ledger + (once resolved) the score
+python -m betting_sim.cli paper --resolve  # settle any markets that have closed
+```
+
+The first batch (logged 2026-07-16, from real web research on live Polymarket
+markets) is a good illustration of how rare edge is: of 5 researched markets,
+only **2** disagreed with the market enough to bet — both fading a slightly-high
+price (Messi to be WC top scorer at 61%; U.S. to invade Iran before 2027 at 23%).
+The other 3, the model just agreed with the market. That ratio *is* the lesson.
+A recurring job re-runs `--resolve` so the ledger settles and scores itself over
+time; the World Cup markets resolve within days, Iran at year-end.
 
 ## Building a forecasting model — the honest way (`cli forecast`)
 

@@ -252,6 +252,59 @@ def cmd_realtest(args: argparse.Namespace) -> None:
     print("\n  All real prices, real outcomes. No bets placed — read only.\n")
 
 
+def cmd_paper(args: argparse.Namespace) -> None:
+    from . import paperlog as pl
+    data = pl.load()
+
+    if args.resolve:
+        try:
+            newly = pl.resolve(data)
+        except Exception as e:  # noqa: BLE001
+            print(f"\ncould not resolve: {e}\n")
+            newly = []
+        if newly:
+            pl.save(data)
+            print(f"\nresolved {len(newly)} bet(s):")
+            for b in newly:
+                res = "YES" if b["outcome"] == 1 else "NO"
+                mark = "" if b["side"] == "none" else \
+                    (f"  P&L {b['pnl']:+.3f}" if b["pnl"] else "")
+                print(f"  [{res:3}] {b['question'][:50]}{mark}")
+        else:
+            print("\nno newly-resolved markets (still open or not closed yet).")
+
+    sc = pl.scorecard(data, edge_threshold=args.edge_threshold)
+    print(f"\n=== PAPER-TRADING LEDGER ===")
+    print(f"  forecasts logged : {sc['n_total']}")
+    print(f"  open (waiting)   : {sc['n_open']}")
+    print(f"  resolved         : {sc['n_resolved']}")
+
+    print("\n  open positions:")
+    for b in data["bets"]:
+        if b["status"] != "open":
+            continue
+        tag = "NO BET" if b["side"] == "none" else f"BET {b['side'].upper()}"
+        print(f"    [{tag:6}] model {b['model_prob']:.2f} vs mkt "
+              f"{b['market_prob']:.2f} (edge {b['edge']:+.2f})  "
+              f"closes {b['close_date']}  {b['question'][:40]}")
+
+    if sc["n_resolved"] == 0:
+        print("\n  Nothing resolved yet — no score to report. That's correct:")
+        print("  we score only settled markets, strictly out-of-sample. Check")
+        print("  back after the close dates above.\n")
+        return
+
+    print(f"\n  settled P&L      : {sc['net_pnl']:+.3f} u on {sc['staked']:.0f}u "
+          f"staked  (ROI {sc['roi']:+.1%})")
+    ev = sc["evaluation"]
+    if ev:
+        print(ev.format())
+    if sc["n_resolved"] < 30:
+        print(f"  NOTE: only {sc['n_resolved']} resolved — far too few to conclude")
+        print("  anything. Skill/ROI here is mostly noise until N is in the")
+        print("  dozens+. Keep logging and resolving before trusting the verdict.\n")
+
+
 def cmd_forecast(args: argparse.Namespace) -> None:
     import math
     import random
@@ -496,6 +549,13 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    pa = sub.add_parser("paper",
+                        help="paper-trading ledger: log forecasts, resolve, score")
+    pa.add_argument("--resolve", action="store_true",
+                    help="check open bets against Polymarket and settle closed ones")
+    pa.add_argument("--edge-threshold", type=float, default=0.05)
+    pa.set_defaults(func=cmd_paper)
 
     fo = sub.add_parser("forecast",
                         help="score forecasting models: skill vs market, calibration, ROI")
