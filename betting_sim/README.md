@@ -16,6 +16,7 @@ sportsbook to learn the answer.*
 python -m betting_sim.cli demo            # strategy comparison: why 'safe' loses
 python -m betting_sim.cli shop            # line shopping & arbitrage (synthetic)
 python -m betting_sim.cli realtest        # backtest on REAL free historical odds
+python -m betting_sim.cli compound        # can $100 grow itself on favorites?
 python -m betting_sim.cli grade           # grade one example market
 python -m betting_sim.tests.test_oddsmath # money-math tests (+ test_lineshop, test_realdata)
 ```
@@ -98,6 +99,41 @@ between books, so "bet whichever book beats the consensus fair value" almost
 never clears as a standalone +EV play. Real soft-book value comes from **stale
 or slow-moving lines** (a book late to update after news/an injury), not from a
 clean snapshot — so this sim deliberately doesn't manufacture it.
+
+## Can $100 compound itself on heavy favorites? (`cli compound`)
+
+The plan: start with $100, bet heavy favorites (e.g. −800), and stake more as
+the roll grows. `compound` Monte-Carlos it over 20,000 runs. The result is the
+most important number in this whole repo:
+
+```
+python -m betting_sim.cli compound            # -800 favorite, 25% of roll
+python -m betting_sim.cli compound --american -400 --fraction 0.1
+```
+
+Even in the **impossible best case** — the book takes *zero* vig, so the bet is
+exactly break-even — staking 25% of the roll on a −800 favorite gives:
+
+| | break-even (zero vig) | realistic (you pay vig) |
+|---|---|---|
+| avg edge per bet | 0.000% | −1.7% |
+| **median ending roll (from $100)** | **~$43** | **~$12** |
+| mean ending roll | ~$100 | ~$43 |
+| ended in profit | 27% of runs | 11% of runs |
+| ruin rate | 24% | 47% |
+
+Read the median vs the mean. The **average** stays near $100 — that's the number
+that makes the plan feel safe. But the **typical** run (median) loses more than
+half, because compounding a high-variance bet has a *negative log-growth rate*
+even at break-even. The mean is propped up by a few lucky runs you'll almost
+never be in. Betting a bigger slice as you grow doesn't compound your way up —
+it just adds drama on the way to zero.
+
+**Compounding multiplies a real edge. It cannot create one.** With no edge it
+drifts to zero; with a −EV bet it gets there faster. The only thing that makes
+"start small and grow it" work is a genuine edge (positive CLV) *first* — then a
+*small* fraction (quarter-Kelly) compounds it safely. Edge is the whole game;
+bankroll growth is just what a real edge does on its own.
 
 ## Real historical data (`python -m betting_sim.cli realtest`)
 

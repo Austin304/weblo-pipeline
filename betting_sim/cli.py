@@ -252,6 +252,39 @@ def cmd_realtest(args: argparse.Namespace) -> None:
     print("\n  All real prices, real outcomes. No bets placed — read only.\n")
 
 
+def cmd_compound(args: argparse.Namespace) -> None:
+    from . import bankroll, oddsmath
+    decimal = (oddsmath.american_to_decimal(args.american) if args.american
+               else args.decimal)
+    implied = 1.0 / decimal
+    print(f"\nThe '$100 compounds itself on favorites' plan")
+    print(f"Favorite price: decimal {decimal:.3f} "
+          f"(needs {implied:.1%} just to break even)")
+    print(f"Staking {args.fraction:.0%} of the bankroll each bet — bets scale up "
+          f"as the roll grows.\n")
+
+    print("A) BEST CASE — pretend the book takes ZERO vig (true rate = the price)")
+    best = bankroll.simulate(start=args.bankroll, decimal=decimal,
+                             true_prob=implied, fraction=args.fraction,
+                             bets=args.bets, runs=args.runs, seed=args.seed)
+    print(best.format())
+
+    print("B) REALISTIC — you pay the vig, so true rate is ~1.5 pts below the price")
+    real = bankroll.simulate(start=args.bankroll, decimal=decimal,
+                             true_prob=None, vig_drag=0.015,
+                             fraction=args.fraction, bets=args.bets,
+                             runs=args.runs, seed=args.seed)
+    print(real.format())
+
+    print("The punchline: even with ZERO vig (case A), the MEDIAN bankroll still")
+    print("shrinks — log-growth is negative because heavy-favorite variance, when")
+    print("you compound it, eats you alive. The average looks fine only because a")
+    print("few lucky runs drag it up; you are almost never in those runs. Betting")
+    print("a bigger slice as you grow makes the swing worse, not safer.")
+    print("Compounding multiplies a REAL edge. It can't create one — and applied")
+    print("to a -EV bet it just gets you to zero with more drama.\n")
+
+
 def cmd_sports(args: argparse.Namespace) -> None:
     from . import oddsapi
     try:
@@ -324,6 +357,20 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    cp = sub.add_parser("compound",
+                        help="Monte-Carlo the '$100 grows itself on favorites' plan")
+    cp.add_argument("--bankroll", type=float, default=100.0)
+    cp.add_argument("--american", type=float, default=-800,
+                    help="favorite price in American odds (e.g. -800)")
+    cp.add_argument("--decimal", type=float, default=1.125,
+                    help="favorite price in decimal (used if --american is 0)")
+    cp.add_argument("--fraction", type=float, default=0.25,
+                    help="share of bankroll staked each bet")
+    cp.add_argument("--bets", type=int, default=200)
+    cp.add_argument("--runs", type=int, default=20000)
+    cp.add_argument("--seed", type=int, default=7)
+    cp.set_defaults(func=cmd_compound)
 
     rt = sub.add_parser("realtest",
                         help="backtest on REAL free historical odds (no key)")
