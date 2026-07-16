@@ -252,6 +252,86 @@ def cmd_realtest(args: argparse.Namespace) -> None:
     print("\n  All real prices, real outcomes. No bets placed — read only.\n")
 
 
+def cmd_forecast(args: argparse.Namespace) -> None:
+    import math
+    import random
+    from . import forecast as fc
+
+    rng = random.Random(args.seed)
+    n = args.markets
+    market_noise, skill_noise = 0.08, 0.05
+
+    truth, market, outcome = [], [], []
+    for _ in range(n):
+        tp = min(0.95, max(0.05, rng.betavariate(1.1, 1.1)))
+        mp = min(0.98, max(0.02, tp + rng.gauss(0, market_noise)))
+        truth.append(tp)
+        market.append(mp)
+        outcome.append(1 if rng.random() < tp else 0)
+
+    def logit(p): return math.log(p / (1 - p))
+    def sig(x): return 1 / (1 + math.exp(-x))
+
+    forecasters = {
+        "market-follower": lambda i: min(0.99, max(0.01, market[i] + rng.gauss(0, 0.01))),
+        "skilled (real edge)": lambda i: min(0.98, max(0.02, truth[i] + rng.gauss(0, skill_noise))),
+        "random noise": lambda i: rng.random(),
+        "overconfident": lambda i: sig(1.9 * logit(min(0.98, max(0.02, market[i])))),
+    }
+
+    print(f"\nForecaster scorecards on {n} synthetic markets (known ground truth).")
+    print("Only a model that is genuinely MORE ACCURATE than the market price "
+          "makes money.\n")
+    for name, fn in forecasters.items():
+        recs = [fc.ForecastRecord(market_id=str(i), forecast_prob=fn(i),
+                                  market_prob=market[i], outcome=outcome[i])
+                for i in range(n)]
+        ev = fc.evaluate(recs, edge_threshold=args.edge_threshold, fee=args.fee)
+        print(f"=== {name} ==={ev.format()}")
+        # compact calibration read: do high-confidence buckets come true?
+        hi = [b for b in ev.calibration if b.lo >= 0.7]
+        if hi:
+            mf = sum(b.mean_forecast * b.n for b in hi) / sum(b.n for b in hi)
+            er = sum(b.empirical_rate * b.n for b in hi) / sum(b.n for b in hi)
+            print(f"  calibration@70%+: said {mf:.0%}, happened {er:.0%}  "
+                  f"({'well calibrated' if abs(mf - er) < 0.06 else 'MISCALIBRATED'})\n")
+
+    print("Takeaway: 'skilled' wins because its Brier beats the market's (positive")
+    print("skill) AND it's calibrated. The follower matches the market -> ~0 edge.")
+    print("Noise and overconfidence can look busy but lose. Your LLM/ML model is")
+    print("just another row here — it only counts if its skill score and ROI are")
+    print("positive out-of-sample. That's the bar. Nothing else is 'a model that")
+    print("works'.\n")
+
+
+def cmd_kalshi(args: argparse.Namespace) -> None:
+    from . import kalshi
+    try:
+        markets = kalshi.fetch_markets(series=args.series,
+                                       min_liquidity=args.min_liquidity,
+                                       max_pages=args.pages)
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not reach Kalshi: {e}\n")
+        return
+    if not markets:
+        print("\nno liquid priced markets found. Try a --series ticker "
+              "(e.g. KXFED, KXPRES) — the default feed is mostly dead combos.\n")
+        return
+    markets.sort(key=lambda m: -m.vol24h)
+    print(f"\n{len(markets)} live Kalshi markets"
+          f"{f' in {args.series}' if args.series else ''} "
+          "(by 24h volume). Prices are implied probabilities.\n")
+    for m in markets[:args.limit]:
+        mid = m.mid
+        sp = m.spread
+        print(f"  {(m.mid or 0):.2f}  {m.title[:52]}  {m.subtitle[:20]}")
+        print(f"        bid/ask {m.yes_bid}/{m.yes_ask}  spread "
+              f"{f'{sp*100:.1f}c' if sp is not None else '?'}  "
+              f"vol24h {m.vol24h:.0f}  liq ${m.liquidity:.0f}")
+    print("\n  Real prices, read only. Feed a model's estimate + these prices +")
+    print("  outcomes into `forecast` to check for real edge.\n")
+
+
 def cmd_pm(args: argparse.Namespace) -> None:
     from . import polymarket
     try:
@@ -416,6 +496,24 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    fo = sub.add_parser("forecast",
+                        help="score forecasting models: skill vs market, calibration, ROI")
+    fo.add_argument("--markets", type=int, default=3000)
+    fo.add_argument("--seed", type=int, default=7)
+    fo.add_argument("--edge-threshold", type=float, default=0.05,
+                    help="min |forecast-market| gap to place a bet")
+    fo.add_argument("--fee", type=float, default=0.0,
+                    help="per-trade cost as fraction of $1 notional")
+    fo.set_defaults(func=cmd_forecast)
+
+    ks = sub.add_parser("kalshi", help="live Kalshi markets (no key); use --series")
+    ks.add_argument("--series", default=None,
+                    help="series ticker for liquid markets, e.g. KXFED, KXPRES")
+    ks.add_argument("--min-liquidity", type=float, default=1000.0)
+    ks.add_argument("--pages", type=int, default=5)
+    ks.add_argument("--limit", type=int, default=15)
+    ks.set_defaults(func=cmd_kalshi)
 
     pm = sub.add_parser("pm",
                         help="live Polymarket data: spread, safe-bet traps, arbs (no key)")

@@ -18,6 +18,8 @@ python -m betting_sim.cli shop            # line shopping & arbitrage (synthetic
 python -m betting_sim.cli realtest        # backtest on REAL free historical odds
 python -m betting_sim.cli compound        # can $100 grow itself on favorites?
 python -m betting_sim.cli pm              # LIVE Polymarket: spread, traps, arbs
+python -m betting_sim.cli forecast        # score a model: skill, calibration, ROI
+python -m betting_sim.cli kalshi --series KXFED   # live Kalshi markets (no key)
 python -m betting_sim.cli grade           # grade one example market
 python -m betting_sim.tests.test_oddsmath # money-math tests (+ test_lineshop, test_realdata)
 ```
@@ -136,6 +138,54 @@ drifts to zero; with a −EV bet it gets there faster. The only thing that makes
 *small* fraction (quarter-Kelly) compounds it safely. Edge is the whole game;
 bankroll growth is just what a real edge does on its own.
 
+## Building a forecasting model — the honest way (`cli forecast`)
+
+This is the "use ML + web search to make a smart betting model" path, built so it
+can't lie to you. **The model is the easy part; knowing whether it has an edge is
+the hard part.** A model that's 80% accurate is worthless if the market is
+already 82% — the market price is itself a strong aggregated model.
+
+So the core here isn't a model, it's the **scorecard** (`forecast.py`) that grades
+*any* forecaster three ways, all out-of-sample:
+
+- **Brier skill vs the market** — is your forecast genuinely more accurate than the
+  price? (skill > 0 or you have nothing)
+- **Calibration** — when you say 70%, does it happen ~70% of the time?
+- **Realized ROI** on edge-selected bets — the money-truth.
+
+`python -m betting_sim.cli forecast` runs four forecasters over synthetic markets
+with known truth:
+
+| forecaster | skill vs market | hit rate | ROI | verdict |
+|---|---|---|---|---|
+| market-follower | +0.000 | — | 0% | places 0 bets — can't beat a price by matching it |
+| **skilled (real edge)** | **+0.018** | 50% | **+7.1%** | **HAS EDGE**, well calibrated |
+| random noise | −0.94 | 33% | ~0% | busy but no edge; wildly miscalibrated |
+| overconfident | −0.06 | **74%** | **−0.3%** | high hit rate, still loses (miscalibrated) |
+
+Note the last row: **74% of bets win and it still loses money** — the same trap as
+"safe favorites," now caught by the scorecard. Your LLM/ML model is just another
+row in this table. It only counts if skill *and* ROI are positive out-of-sample.
+
+### The model layer
+
+- **`llmforecast.py`** — an LLM + web-search forecaster: give it a market question,
+  it researches with Claude's web search and returns a *calibrated* probability
+  (superforecaster prompt: base rate → evidence → avoid overconfidence). It's a
+  pluggable estimator whose output goes straight into `forecast.evaluate()`. Uses
+  the repo's Anthropic key; costs tokens, so nothing runs it automatically.
+  **Honest expectation:** on liquid markets the crowd already read the same news,
+  so the LLM usually just reproduces the price (~zero edge). The plausible edge is
+  *speed* (breaking news), *breadth* (many neglected markets), and *thin* markets.
+- **`kalshi.py`** — live Kalshi market data (US-regulated exchange; the place to
+  actually deploy an edge). Adapter is tested; surfacing liquid markets needs a
+  `--series` ticker from your account, since the public feed front-loads dead
+  combo markets.
+
+**The workflow:** model → forecast → `evaluate` against real prices + outcomes →
+deploy *only* if skill and ROI stay positive out-of-sample. Anything else is a
+backtest fantasy.
+
 ## Prediction markets: Kalshi / Polymarket (`cli pm`)
 
 Prediction-market *exchanges* fix the two things that doom sportsbook betting:
@@ -236,6 +286,11 @@ portfolio.py  SQLite paper bankroll → ROI, win rate, CLV, max drawdown
   (multi-book, opening + closing, with results). Powers `realtest`. No key.
 - **`polymarket.py`** — live Polymarket data via the public Gamma API: spreads,
   safe-bet traps, and liquidity-aware arbitrage. Powers `pm`. No key.
+- **`forecast.py`** — the model scorecard: Brier skill vs market, calibration,
+  and edge-selected ROI. The honest test for any forecaster. Powers `forecast`.
+- **`kalshi.py`** — live Kalshi market data (US-regulated exchange). No key.
+- **`llmforecast.py`** — LLM + web-search forecaster (Claude); pluggable into
+  `forecast.evaluate`. Costs tokens; never runs in the core sim or tests.
 - **`bankroll.py`** — Monte-Carlo of a compounding bankroll (log-growth, ruin
   rate, median vs mean). Powers `compound`.
 - **`oddsapi.py`** — *optional* adapter for real *current* odds from The Odds API
