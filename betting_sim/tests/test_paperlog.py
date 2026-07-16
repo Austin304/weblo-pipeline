@@ -53,6 +53,27 @@ def test_pnl_directions():
     assert pl._pnl("none", 0.6, 1) == 0.0
 
 
+def test_clv_directions():
+    # bet YES at 0.40, line rose to 0.55 before close -> we beat the close (+0.15)
+    assert approx(pl._clv("yes", 0.40, 0.55), 0.15)
+    # bet NO at 0.60, line fell to 0.45 -> beat the close (+0.15)
+    assert approx(pl._clv("no", 0.60, 0.45), 0.15)
+    # bet YES but the line drifted against us -> negative CLV
+    assert pl._clv("yes", 0.60, 0.45) < 0
+    assert pl._clv("none", 0.5, 0.7) == 0.0
+
+
+def test_scorecard_reports_avg_clv():
+    data = _fresh()
+    _add(data, "1", 0.40, 0.60)   # bet NO
+    _add(data, "2", 0.80, 0.60)   # bet YES
+    data["bets"][0].update(status="resolved", outcome=0, pnl=0.6, clv=0.10)
+    data["bets"][1].update(status="resolved", outcome=1, pnl=0.4, clv=0.20)
+    sc = pl.scorecard(data)
+    assert sc["n_clv"] == 2
+    assert approx(sc["avg_clv"], 0.15)
+
+
 def test_scorecard_scores_only_resolved():
     data = _fresh()
     _add(data, "1", 0.40, 0.60)   # bet NO

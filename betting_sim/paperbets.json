@@ -18,7 +18,9 @@
       "status": "open",
       "outcome": null,
       "pnl": null,
-      "resolved_at": null
+      "resolved_at": null,
+      "close_prob": 0.4165,
+      "last_seen_at": "2026-07-16"
     },
     {
       "id": "9eebadc0e9",
@@ -37,7 +39,9 @@
       "status": "open",
       "outcome": null,
       "pnl": null,
-      "resolved_at": null
+      "resolved_at": null,
+      "close_prob": 0.5835,
+      "last_seen_at": "2026-07-16"
     },
     {
       "id": "0660f448e3",
@@ -56,7 +60,9 @@
       "status": "open",
       "outcome": null,
       "pnl": null,
-      "resolved_at": null
+      "resolved_at": null,
+      "close_prob": 0.6135,
+      "last_seen_at": "2026-07-16"
     },
     {
       "id": "b37989c436",
@@ -75,7 +81,9 @@
       "status": "open",
       "outcome": null,
       "pnl": null,
-      "resolved_at": null
+      "resolved_at": null,
+      "close_prob": 0.8925,
+      "last_seen_at": "2026-07-16"
     },
     {
       "id": "2946875fe6",
@@ -94,7 +102,9 @@
       "status": "open",
       "outcome": null,
       "pnl": null,
-      "resolved_at": null
+      "resolved_at": null,
+      "close_prob": 0.225,
+      "last_seen_at": "2026-07-16"
     }
   ]
 }

@@ -366,20 +366,27 @@ def cmd_paper(args: argparse.Namespace) -> None:
 
     if args.resolve:
         try:
+            snapped = pl.snapshot(data)   # refresh the closing line on open bets
             newly = pl.resolve(data)
         except Exception as e:  # noqa: BLE001
             print(f"\ncould not resolve: {e}\n")
-            newly = []
-        if newly:
+            snapped, newly = 0, []
+        if snapped or newly:
             pl.save(data)
-            print(f"\nresolved {len(newly)} bet(s):")
+        if snapped:
+            print(f"\nsnapshotted {snapped} open market price(s) for CLV.")
+        if newly:
+            print(f"resolved {len(newly)} bet(s):")
             for b in newly:
                 res = "YES" if b["outcome"] == 1 else "NO"
-                mark = "" if b["side"] == "none" else \
-                    (f"  P&L {b['pnl']:+.3f}" if b["pnl"] else "")
-                print(f"  [{res:3}] {b['question'][:50]}{mark}")
-        else:
-            print("\nno newly-resolved markets (still open or not closed yet).")
+                extra = ""
+                if b["side"] != "none":
+                    extra = f"  P&L {b['pnl']:+.3f}"
+                    if b.get("clv") is not None:
+                        extra += f"  CLV {b['clv']:+.3f}"
+                print(f"  [{res:3}] {b['question'][:46]}{extra}")
+        elif not snapped:
+            print("\nno open markets to snapshot or resolve.")
 
     sc = pl.scorecard(data, edge_threshold=args.edge_threshold)
     print(f"\n=== PAPER-TRADING LEDGER ===")
@@ -404,6 +411,13 @@ def cmd_paper(args: argparse.Namespace) -> None:
 
     print(f"\n  settled P&L      : {sc['net_pnl']:+.3f} u on {sc['staked']:.0f}u "
           f"staked  (ROI {sc['roi']:+.1%})")
+    if sc["avg_clv"] is not None:
+        signal = ("BEATING the close — real-edge signal" if sc["avg_clv"] > 0
+                  else "losing to the close — no edge yet")
+        print(f"  avg CLV          : {sc['avg_clv']:+.3f} on {sc['n_clv']} bets  "
+              f"<- {signal}")
+        print("     (CLV is the leading indicator: it turns positive BEFORE the")
+        print("      P&L does, on a smaller sample. Watch this first.)")
     ev = sc["evaluation"]
     if ev:
         print(ev.format())

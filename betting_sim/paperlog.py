@@ -66,6 +66,9 @@ def add_forecast(data: dict, *, platform: str, market_id: str, slug: str,
         "model_prob": round(model_prob, 4), "market_prob": round(market_prob, 4),
         "edge": edge, "side": side, "stake": stake if side != "none" else 0.0,
         "rationale": rationale,
+        # entry price = market_prob at bet time; close_prob is the last price we
+        # see while the market is still open (the closing line for CLV).
+        "close_prob": None, "last_seen_at": None, "clv": None,
         "status": "open", "outcome": None, "pnl": None, "resolved_at": None,
     }
     data["bets"].append(rec)
@@ -91,6 +94,48 @@ def _pnl(side: str, market_prob: float, outcome: int) -> float:
     return 0.0
 
 
+def _clv(side: str, entry_prob: float, close_prob: float) -> float:
+    """Closing-line value in probability terms: did the line move toward the
+    side we took? Positive = we beat the close (the market came to agree with
+    us), the earliest hard signal of a real edge — it shows up even on bets that
+    ultimately lose. For a 'yes' bet we want the price to rise; for 'no', fall.
+    """
+    if side == "yes":
+        return close_prob - entry_prob
+    if side == "no":
+        return entry_prob - close_prob
+    return 0.0
+
+
+def _current_yes_price(market: dict) -> float | None:
+    try:
+        prices = json.loads(market.get("outcomePrices", "[]"))
+        return float(prices[0])
+    except (ValueError, IndexError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def snapshot(data: dict) -> int:
+    """Capture the current price of every still-open bet, keeping it as the
+    running 'closing line'. Run this regularly (the scheduled job does) so that
+    when a market closes, close_prob holds the last price we saw while it was
+    live. Returns how many bets were updated."""
+    updated = 0
+    for b in data["bets"]:
+        if b["status"] != "open":
+            continue
+        m = _fetch_market(b["market_id"])
+        if not m or m.get("closed"):
+            continue
+        price = _current_yes_price(m)
+        if price is None:
+            continue
+        b["close_prob"] = round(price, 4)
+        b["last_seen_at"] = _now()
+        updated += 1
+    return updated
+
+
 def resolve(data: dict) -> list[dict]:
     """Check every open bet against Polymarket; settle the ones that closed.
     Returns the list of newly-resolved records."""
@@ -108,6 +153,13 @@ def resolve(data: dict) -> list[dict]:
             continue
         b["outcome"] = outcome
         b["pnl"] = round(_pnl(b["side"], b["market_prob"], outcome), 4)
+        # CLV vs the last price we saw while open. If we never snapshotted it
+        # (closed between checks), fall back to the settle outcome as the close.
+        close_prob = b.get("close_prob")
+        if close_prob is None:
+            close_prob = float(outcome)
+        if b["side"] != "none":
+            b["clv"] = round(_clv(b["side"], b["market_prob"], close_prob), 4)
         b["status"] = "resolved"
         b["resolved_at"] = _now()
         newly.append(b)
@@ -126,6 +178,8 @@ def scorecard(data: dict, *, edge_threshold: float = 0.05) -> dict:
     open_bets = [b for b in data["bets"] if b["status"] == "open"]
     net = sum(b["pnl"] for b in resolved if b["pnl"] is not None)
     staked = sum(b["stake"] for b in resolved if b["side"] != "none")
+    clvs = [b["clv"] for b in resolved
+            if b["side"] != "none" and b.get("clv") is not None]
     return {
         "n_total": len(data["bets"]),
         "n_open": len(open_bets),
@@ -133,5 +187,7 @@ def scorecard(data: dict, *, edge_threshold: float = 0.05) -> dict:
         "net_pnl": round(net, 4),
         "staked": round(staked, 4),
         "roi": round(net / staked, 4) if staked else 0.0,
+        "n_clv": len(clvs),
+        "avg_clv": round(sum(clvs) / len(clvs), 4) if clvs else None,
         "evaluation": ev,
     }

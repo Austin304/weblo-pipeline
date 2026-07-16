@@ -198,8 +198,16 @@ design (see `paperlog.py`):
 
 ```bash
 python -m betting_sim.cli paper            # show the ledger + (once resolved) the score
-python -m betting_sim.cli paper --resolve  # settle any markets that have closed
+python -m betting_sim.cli paper --resolve  # snapshot open prices + settle closed ones
 ```
+
+**CLV — the early-warning signal.** `--resolve` also snapshots each open bet's
+current price, keeping the last price seen while the market was live as its
+"closing line." On settlement it records **CLV**: did the line move *toward* the
+side we bet? Positive CLV means the market came to agree with us — and it shows
+up **before** the P&L does, on a smaller sample, *even on bets that lose*. It's
+the single fastest read on "is the edge real?" The scorecard prints avg CLV and
+flags it as the real-edge signal to watch first.
 
 The first batch (logged 2026-07-16, from real web research on live Polymarket
 markets) is a good illustration of how rare edge is: of 5 researched markets,
