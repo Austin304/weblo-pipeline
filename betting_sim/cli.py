@@ -145,6 +145,55 @@ def cmd_shop(args: argparse.Namespace) -> None:
     print("difference between a slow loss and a slow win.\n")
 
 
+def cmd_sports(args: argparse.Namespace) -> None:
+    from . import oddsapi
+    try:
+        sports = oddsapi.list_sports(args.key)
+    except Exception as e:  # noqa: BLE001 - surface the reason plainly
+        print(f"\ncould not list sports: {e}\n")
+        return
+    active = [s for s in sports if s.get("active")]
+    print(f"\n{len(active)} active sports/leagues (key -> title):\n")
+    for s in active:
+        print(f"  {s['key']:32} {s['title']}")
+    print("\nUse one as: python -m betting_sim.cli live --sport <key>\n")
+
+
+def cmd_live(args: argparse.Namespace) -> None:
+    from . import lineshop, oddsapi
+    try:
+        games = oddsapi.fetch_games(args.sport, regions=args.regions,
+                                    api_key=args.key)
+    except Exception as e:  # noqa: BLE001
+        print(f"\ncould not fetch odds: {e}\n")
+        return
+    if not games:
+        print(f"\nno live h2h markets for '{args.sport}' right now.\n")
+        return
+
+    print(f"\n{len(games)} live games for {args.sport} — best line across books:\n")
+    arbs = []
+    for snap in games:
+        h, a = snap.home_price, snap.away_price
+        print(f"  {a.selection} @ {a.decimal:.2f} ({a.book})  vs  "
+              f"{h.selection} @ {h.decimal:.2f} ({h.book})")
+        arb = lineshop.find_arbitrage(snap.game_id, snap.book_quotes)
+        if arb:
+            arbs.append((snap, arb))
+
+    if arbs:
+        print(f"\n  *** {len(arbs)} ARBITRAGE opportunity(ies) — free money ***")
+        for snap, arb in arbs:
+            print(f"    {snap.away_price.selection} @ {arb.away_decimal:.2f} "
+                  f"({arb.away_book}) + {snap.home_price.selection} @ "
+                  f"{arb.home_decimal:.2f} ({arb.home_book}) -> "
+                  f"{arb.profit_margin:+.2%} guaranteed "
+                  f"(stake {arb.stake_home:.2f}/{arb.stake_away:.2f} per 1u)")
+    else:
+        print("\n  no arbitrage right now (normal — they're rare and fleeting).")
+    print("\n  These are REAL prices. Still no bets placed — read only.\n")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="betting_sim",
                                  description="Paper-trading sim. No real money.")
@@ -168,6 +217,17 @@ def main() -> None:
     s.add_argument("--book", default="fanduel",
                    help="the single book to compare against best-line shopping")
     s.set_defaults(func=cmd_shop)
+
+    sp = sub.add_parser("sports", help="list real sport keys (needs ODDS_API_KEY)")
+    sp.add_argument("--key", default=None, help="Odds API key (or set ODDS_API_KEY)")
+    sp.set_defaults(func=cmd_sports)
+
+    lv = sub.add_parser("live", help="real current lines + arbs (needs ODDS_API_KEY)")
+    lv.add_argument("--sport", default="upcoming",
+                    help="sport key, e.g. basketball_nba (see `sports`)")
+    lv.add_argument("--regions", default="us", help="us, uk, eu, au")
+    lv.add_argument("--key", default=None, help="Odds API key (or set ODDS_API_KEY)")
+    lv.set_defaults(func=cmd_live)
 
     args = ap.parse_args()
     args.func(args)
