@@ -397,11 +397,22 @@ def _img_fingerprint(url: str) -> str:
 
 
 def _images_used_in_build(slug: str) -> set[str]:
-    """Fingerprints of every <img> a prior build placed — used to exclude photos a
+    """Fingerprints of every image a prior build placed — used to exclude photos a
     human reviewer rejected from the next rebuild of the same lead."""
     if not slug:
         return set()
-    p = config.SAMPLES_CACHE_DIR / slug / "index.html"
+    d = config.SAMPLES_CACHE_DIR / slug
+    # self-hosted builds rewrite srcs to local files, so recover the ORIGIN urls from
+    # the sources sidecar (local file -> remote url) to fingerprint against.
+    sj = d / "sources.json"
+    if sj.is_file():
+        try:
+            origins = json.loads(sj.read_text(encoding="utf-8")).values()
+            return {_img_fingerprint(u) for u in origins if u.startswith("http")}
+        except Exception:
+            pass
+    # legacy build that hotlinked remote urls directly in the HTML
+    p = d / "index.html"
     if not p.is_file():
         return set()
     html = p.read_text(encoding="utf-8", errors="ignore")
@@ -1793,6 +1804,74 @@ def extract_html(raw: str) -> str:
     return text[start:].strip() if start != -1 else text.strip()
 
 
+# content-type -> extension for images we self-host (see _localize_images)
+_IMG_EXT = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+            "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif",
+            "image/svg+xml": ".svg"}
+
+
+def _localize_images(html: str, out_dir) -> tuple[str, list[str]]:
+    """Download every external image the FINAL page references into `out_dir` and
+    rewrite the HTML to point at the local copies (relative filenames). This makes
+    each sample self-contained: immune to third-party CDN URL-rot in a sent email
+    (a prospect opening the link days later never sees a broken hero), and compliant
+    with sources that forbid hotlinking (e.g. Pixabay — download-and-host required).
+
+    Also writes `out_dir/sources.json` (local file -> origin URL) so the per-lead
+    learning loop can still exclude a reviewer-rejected photo on a rebuild even though
+    the shipped HTML now shows local filenames (see _images_used_in_build).
+
+    Any download that fails leaves the original URL in place — never breaks an image.
+    Returns (rewritten_html, origin_urls_downloaded)."""
+    urls: list[str] = []
+    seen = set()
+    for u in re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        if u not in seen:
+            seen.add(u); urls.append(u)
+    for ss in re.findall(r'srcset=["\']([^"\']+)["\']', html, re.I):
+        for part in ss.split(","):
+            u = part.strip().split(" ")[0].strip()
+            if u and u not in seen:
+                seen.add(u); urls.append(u)
+    for u in re.findall(r'url\(\s*["\']?([^"\')]+?)["\']?\s*\)', html, re.I):
+        if u not in seen:
+            seen.add(u); urls.append(u)
+    external = [u for u in urls if u.startswith("http")]
+    if not external:
+        return html, []
+    sources: dict[str, str] = {}
+    downloaded: list[str] = []
+    for i, url in enumerate(external):
+        fetch_url = url.replace("&amp;", "&")  # attributes may HTML-escape query &s
+        try:
+            r = requests.get(fetch_url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+        except requests.RequestException:
+            continue
+        if r.status_code != 200 or not r.content:
+            log.warning("localize: %s for %s", r.status_code, fetch_url[:80])
+            continue
+        ctype = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        ext = _IMG_EXT.get(ctype)
+        if not ext:
+            m = re.search(r"\.(jpe?g|png|webp|gif|avif|svg)(?:\?|$)", url, re.I)
+            ext = ("." + m.group(1).lower().replace("jpeg", "jpg")) if m else ".jpg"
+        fname = f"img{i}{ext}"
+        try:
+            (out_dir / fname).write_bytes(r.content)
+        except OSError:
+            log.warning("localize: could not write %s", fname)
+            continue
+        html = html.replace(url, fname)
+        sources[fname] = url
+        downloaded.append(url)
+    if sources:
+        try:
+            (out_dir / "sources.json").write_text(json.dumps(sources), encoding="utf-8")
+        except OSError:
+            log.warning("localize: could not write sources.json")
+    return html, downloaded
+
+
 def _ship_sample(conn, lead, html: str, image_source: str,
                  fact_flag_note: str | None = None) -> bool:
     """Persist a finished sample and transition the lead to SAMPLE_BUILT — the
@@ -1800,11 +1879,16 @@ def _ship_sample(conn, lead, html: str, image_source: str,
     slug = unique_slug(conn, lead)
     out_dir = config.SAMPLES_CACHE_DIR / slug
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "index.html").write_text(html, encoding="utf-8")
-    # remember which stock photos this sample actually placed, so the next build
-    # picks different ones (no repeated stock across samples)
+    # remember which stock photos this sample placed (by their REMOTE url) BEFORE
+    # self-hosting rewrites the srcs to local files — so the next build picks
+    # different stock (no repeated stock across samples).
     if image_source in ("stock", "mixed"):
         remember_stock(re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I))
+    # self-host every external image (URL-rot immunity + no-hotlink compliance)
+    html, localized = _localize_images(html, out_dir)
+    if localized:
+        log.info("lead %s: self-hosted %d image(s)", lead["id"], len(localized))
+    (out_dir / "index.html").write_text(html, encoding="utf-8")
     url = f"{config.SAMPLE_BASE_URL}/{slug}"
     notes = fact_flag_note
     try:

@@ -5,8 +5,9 @@ postcard lead's FIRST visit. Fronted publicly by the Cloudflare Tunnel.
 Run as a systemd service on the VM:  python serve_samples.py
 """
 import logging
+import re
 
-from flask import Flask, abort, request, send_from_directory
+from flask import Flask, abort, redirect, request, send_from_directory
 
 import config
 import db
@@ -16,6 +17,9 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 
 SAFE_SLUG = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+# self-hosted sample images (see build_sample._localize_images) are served from the
+# slug dir alongside index.html; only these extensions are served as assets.
+ASSET_RE = re.compile(r"\.(jpe?g|png|webp|gif|avif|svg|ico)$", re.I)
 
 
 @app.get("/healthz")
@@ -24,6 +28,30 @@ def healthz():
 
 
 @app.get("/<slug>")
+def sample_redirect(slug: str):
+    """Redirect the bare slug to the trailing-slash form so the page's RELATIVE
+    image paths (img0.jpg, from self-hosting) resolve to /<slug>/img0.jpg. The
+    stored sample_url has no trailing slash, so every emailed link lands here first."""
+    slug = slug.lower()
+    if not slug or set(slug) - SAFE_SLUG:
+        abort(404)
+    if not (config.SAMPLES_CACHE_DIR / slug / "index.html").is_file():
+        abort(404)
+    return redirect(f"/{slug}/", code=308)
+
+
+@app.get("/<slug>/<path:filename>")
+def sample_asset(slug: str, filename: str):
+    """Serve a self-hosted image asset from the sample's own folder."""
+    slug = slug.lower()
+    if not slug or set(slug) - SAFE_SLUG or not ASSET_RE.search(filename):
+        abort(404)
+    d = config.SAMPLES_CACHE_DIR / slug
+    if not (d / "index.html").is_file():
+        abort(404)
+    return send_from_directory(d, filename)  # guards path traversal
+
+
 @app.get("/<slug>/")
 def sample(slug: str):
     slug = slug.lower()
