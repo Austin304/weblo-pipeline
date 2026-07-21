@@ -134,6 +134,11 @@ NICHE_BRIEFS = {
         imagery="A genuine healthy smile; a professionally-dressed dentist/team; a "
                 "warm dentist-with-patient moment; a bright welcoming reception",
         stock_query="happy healthy smile dental patient",
+        # extra warm queries widen the pool (merged in stock_images) so there are more
+        # genuine-smile / warm-reception / friendly-team hero options and less repetition
+        extra_stock_queries=("confident bright smile portrait",
+                             "modern dental office reception",
+                             "friendly dentist smiling with patient"),
         # clinical service terms ("dental implants") return cold surgical stock, so
         # skip the service-led query and use the curated warm one above
         avoid_service_query=True,
@@ -378,9 +383,12 @@ STOCK_USED_FILE = config.LOGS_DIR / "used_stock.json"
 
 
 def _stock_id(url: str) -> str:
-    """Stable per-photo key so the same Pexels/Unsplash photo dedupes across builds
-    regardless of size/query-string variation (e.g. .../photos/3757952/... -> 3757952)."""
-    m = re.search(r"/photos/(\d+)/", url) or re.search(r"photo-([\w-]+)", url)
+    """Stable per-photo key so the same Pexels/Unsplash/Pixabay photo dedupes across
+    builds regardless of size/query-string variation (e.g. .../photos/3757952/... ->
+    3757952; Pixabay .../get/<hash>.jpg -> the hash; cdn .../name-428646_1280.jpg -> 428646)."""
+    m = (re.search(r"/photos/(\d+)/", url) or re.search(r"photo-([\w-]+)", url)
+         or re.search(r"pixabay\.com/get/(\w+)", url)
+         or re.search(r"pixabay\.com/.*?[-_](\d{4,})(?:_\d+)?\.", url))
     return m.group(1) if m else url
 
 
@@ -431,7 +439,8 @@ def _used_stock() -> set[str]:
 def remember_stock(urls: list[str]) -> None:
     """Persist the stock photos a shipped sample actually used, so later builds pick
     DIFFERENT ones — Austin flagged identical stock photos across samples (215/230)."""
-    ids = {_stock_id(u) for u in urls if "pexels.com" in u or "unsplash.com" in u}
+    ids = {_stock_id(u) for u in urls
+           if any(s in u for s in ("pexels.com", "unsplash.com", "pixabay.com"))}
     if not ids:
         return
     try:
@@ -471,10 +480,17 @@ def _stock_queries(brief: dict, services: list[str]) -> list[str]:
         if specific and specific.lower() not in generic.lower():
             queries.append(specific)
     queries.append(generic)
+    # extra curated warm queries widen the pool for more variety (fewer repeats
+    # across samples) and more on-tone hero options — see stock_images (merged pool)
+    for q in brief.get("extra_stock_queries") or []:
+        if q not in queries:
+            queries.append(q)
     return queries
 
 
 def _pexels_search(query: str) -> list[str]:
+    if not config.PEXELS_API_KEY:
+        return []
     try:
         r = requests.get(
             "https://api.pexels.com/v1/search",
@@ -493,7 +509,34 @@ def _pexels_search(query: str) -> list[str]:
     return []
 
 
+def _pixabay_search(query: str) -> list[str]:
+    """Pixabay stock (free, permissive license). Its URLs must NOT be hotlinked
+    permanently (their ToS), but we self-host every shipped image (_localize_images),
+    so downloading the chosen ones is compliant. Returns landscape largeImageURLs."""
+    if not config.PIXABAY_API_KEY:
+        return []
+    try:
+        r = requests.get(
+            "https://pixabay.com/api/",
+            params={"key": config.PIXABAY_API_KEY, "q": query[:100],
+                    "image_type": "photo", "orientation": "horizontal",
+                    "per_page": 50, "safesearch": "true", "min_width": 1200},
+            timeout=15)
+        if r.status_code == 200:
+            urls = [h["largeImageURL"] for h in r.json().get("hits", [])
+                    if h.get("imageWidth", 0) >= 1200 and h.get("largeImageURL")]
+            if not urls:
+                log.warning("pixabay: 0 usable results for %r", query)
+            return urls
+        log.warning("pixabay HTTP %s for %r: %s", r.status_code, query, r.text[:120])
+    except requests.RequestException:
+        log.warning("pixabay search failed for %r", query)
+    return []
+
+
 def _unsplash_search(query: str) -> list[str]:
+    if not config.UNSPLASH_ACCESS_KEY:
+        return []
     try:
         r = requests.get(
             "https://api.unsplash.com/search/photos",
@@ -509,25 +552,38 @@ def _unsplash_search(query: str) -> list[str]:
 
 def stock_images(lead, brief: dict, limit: int = 8,
                  services: list[str] | None = None) -> list[str]:
-    """Ladder step 3 — free niche stock (Pexels, then Unsplash). Both APIs are
-    $0; a clean stock photo beats a typographic hero every time. Returns
+    """Ladder step 3 — free niche stock (Pexels + Pixabay + Unsplash). All three
+    APIs are $0; a clean stock photo beats a typographic hero every time. Returns
     CANDIDATES (up to `limit`) — the generator picks the few that fit the
     palette/mood, so more choices = better odds of an on-brand hero. Returns []
     when no key is configured or nothing landscape/large comes back.
 
-    Tries a service-specific query first (see _stock_queries), then the generic
-    niche query. Fetches a LARGE pool and dedupes against photos other samples
-    already used (see _dedupe_pool) so no two samples share stock photos."""
+    MERGES results across several queries (see _stock_queries) and all configured
+    sources, INTERLEAVED (round-robin) so the pool blends sources/queries instead of
+    being dominated by whichever returned first — otherwise Pexels' 80 results would
+    bury Pixabay's every time. Dedupes within the pool and against photos other samples
+    already used (see _dedupe_pool) so no two samples share the same stock photo."""
+    seen: set[str] = set()
+    buckets: list[list[str]] = []   # one list per (query, source) that returned hits
     for query in _stock_queries(brief, services or []):
-        if config.PEXELS_API_KEY:
-            urls = _pexels_search(query)
-            if urls:
-                return _dedupe_pool(urls, lead, limit)
-        if config.UNSPLASH_ACCESS_KEY:
-            urls = _unsplash_search(query)
-            if urls:
-                return _dedupe_pool(urls, lead, limit)
-    return []
+        for search in (_pexels_search, _pixabay_search, _unsplash_search):
+            fresh = []
+            for u in search(query):
+                sid = _stock_id(u)
+                if sid not in seen:
+                    seen.add(sid)
+                    fresh.append(u)
+            if fresh:
+                buckets.append(fresh)
+        if sum(len(b) for b in buckets) >= limit * 5:   # enough variety; stop querying
+            break
+    if not buckets:
+        return []
+    # round-robin the buckets: take the 1st of each, then the 2nd of each, ... so the
+    # front of the pool spans every query x source combo (best-of-each first)
+    pool = [b[i] for i in range(max(len(b) for b in buckets))
+            for b in buckets if i < len(b)]
+    return _dedupe_pool(pool, lead, limit)
 
 
 def select_images(conn, lead, profile: dict, brief: dict, service_desc: str = "",
@@ -635,6 +691,28 @@ def _merge_owner_stock(owner: tuple[list[str], dict], stock: tuple[list[str], di
     return merged, "mixed", {u: notes[u] for u in merged}
 
 
+def _qc_image_source(url: str) -> dict | None:
+    """Image content block for the vision QC. Some hosts (e.g. Pixabay) block the
+    Anthropic image fetcher, which 400s the whole ranking call, so those are downloaded
+    and sent INLINE as base64 (we can fetch them with a browser UA); every other host
+    stays a cheap URL ref. Returns None when an inline image can't be downloaded, so the
+    caller can drop it."""
+    if "pixabay.com" in url:
+        try:
+            r = requests.get(url.replace("&amp;", "&"), timeout=20,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.content:
+                media = (r.headers.get("Content-Type", "").split(";")[0].strip()
+                         or "image/jpeg")
+                return {"type": "image",
+                        "source": {"type": "base64", "media_type": media,
+                                   "data": base64.b64encode(r.content).decode()}}
+        except requests.RequestException:
+            pass
+        return None
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
 def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
                              service_desc: str = "",
                              hero_guidance: str = "") -> tuple[list[str], dict]:
@@ -688,9 +766,21 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
         "background). Also note WHERE the main subject sits in the "
         "frame, so a CSS crop can be aimed to keep it (a wide hero crops off top and "
         "bottom; a tall column crops off the sides)." + match_line + hero_line}]
-    for i, url in enumerate(urls):
-        content.append({"type": "text", "text": f"Image {i+1}:"})
-        content.append({"type": "image", "source": {"type": "url", "url": url}})
+    # Build one image block per candidate. The Anthropic image fetcher is blocked by
+    # some hosts (e.g. Pixabay), so those are downloaded and sent INLINE as base64
+    # (we can fetch them ourselves); other hosts stay cheap URL refs. An image that
+    # can't be fetched at all is dropped so one bad URL can't 400 the whole call.
+    qc_urls: list[str] = []
+    for url in urls:
+        src = _qc_image_source(url)
+        if src is None:
+            log.warning("qc: skipping unfetchable image %s", url[:70])
+            continue
+        content.append({"type": "text", "text": f"Image {len(qc_urls) + 1}:"})
+        content.append(src)
+        qc_urls.append(url)
+    if not qc_urls:
+        return urls, {}
     content.append({"type": "text", "text":
         "Return STRICT JSON only:\n"
         '{"images": [{"n": 1, "desc": "<=12 words: subject + quality", '
@@ -705,7 +795,7 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
             # scale with the pool: each image needs ~130 tokens of JSON (desc +
             # hero + use + match + focus), so a fixed cap truncated 8-image stock
             # pools into unparseable JSON and the QC silently no-op'd.
-            model=config.MODEL_CLASSIFIER, max_tokens=min(2000, 300 + 140 * len(urls)),
+            model=config.MODEL_CLASSIFIER, max_tokens=min(2000, 300 + 140 * len(qc_urls)),
             system="You are a photo editor for premium web design. Be blunt about quality.",
             messages=[{"role": "user", "content": content}],
         )
@@ -727,20 +817,21 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
     notes = {}
     for item in data.get("images") or []:
         n = _as_int(item.get("n"))
-        if 1 <= n <= len(urls):
+        if 1 <= n <= len(qc_urls):
             foc = str(item.get("focus") or "center").lower()
             # a wrong-service photo is unusable regardless of how pretty it is
-            usable = bool(item.get("use", True)) and bool(item.get("match", True))
-            notes[urls[n - 1]] = {
+            ok = bool(item.get("use", True)) and bool(item.get("match", True))
+            notes[qc_urls[n - 1]] = {
                 "desc": str(item.get("desc") or "")[:120],
                 "hero": _as_int(item.get("hero")),
-                "use": usable,
+                "use": ok,
                 "focus": foc if foc in FOCUS_CSS else "center",
             }
     if not notes:
         return urls, {}
-    # best hero first; sorted() is stable so equal scores keep their prior order
-    ordered = sorted(urls, key=lambda u: -(notes.get(u, {}).get("hero") or 0))
+    # best hero first; sorted() is stable so equal scores keep their prior order.
+    # Rank only the images we actually sent (unfetchable ones were dropped above).
+    ordered = sorted(qc_urls, key=lambda u: -(notes.get(u, {}).get("hero") or 0))
     log.info("lead %s photo rank: %s", lead["id"],
              [(notes[u]["hero"], notes[u]["desc"]) for u in ordered if u in notes])
     return ordered, notes

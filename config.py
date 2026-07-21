@@ -58,9 +58,10 @@ def get_float(key: str, default: float) -> float:
 ANTHROPIC_API_KEY = get("ANTHROPIC_API_KEY")
 GOOGLE_PLACES_API_KEY = get("GOOGLE_PLACES_API_KEY")
 ZEROBOUNCE_API_KEY = get("ZEROBOUNCE_API_KEY")  # optional; MX fallback if blank
-# optional free stock-photo APIs (image ladder step 3; both free tiers)
+# optional free stock-photo APIs (image ladder step 3; all free tiers)
 PEXELS_API_KEY = get("PEXELS_API_KEY")
 UNSPLASH_ACCESS_KEY = get("UNSPLASH_ACCESS_KEY")
+PIXABAY_API_KEY = get("PIXABAY_API_KEY")
 DB_PATH = str((_HERE / get("DB_PATH", "leads.db")).resolve()) if not os.path.isabs(get("DB_PATH", "leads.db")) else get("DB_PATH")
 
 # --- samples / tunnel ---
