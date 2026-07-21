@@ -100,6 +100,13 @@ CAMPAIGN_AREAS = [a.strip() for a in (get("CAMPAIGN_AREAS", "") or "").split(";"
 MODEL_QUALITY = "claude-opus-4-8"          # sample HTML + email copy
 MODEL_CLASSIFIER = "claude-haiku-4-5-20251001"  # reply classification
 
+# --- sample generation: best-of-N (turn generation variance into a selection asset) ---
+# For each lead, generate this many diverse candidate samples (one per design
+# language) and ship the one a pairwise vision tournament judges best. 1 = legacy
+# single-shot. >1 REQUIRES Playwright (the calibration laptop has it); the build
+# auto-falls back to single-shot wherever Playwright is unavailable (e.g. the VM).
+BEST_OF_N = get_int("BEST_OF_N", 4)
+
 # --- budgets (doc 08) ---
 PIPELINE_MONTHLY_BUDGET_USD = get_float("PIPELINE_MONTHLY_BUDGET_USD", 150)
 CLAUDE_MONTHLY_BUDGET_USD = get_float("CLAUDE_MONTHLY_BUDGET_USD", 50)

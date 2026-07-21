@@ -50,6 +50,16 @@ Recurring flaws and confirmed wins from human review. Apply every relevant one.
   face", "your problem areas"). Warm, at a respectful distance.
 - Plain labels beat flowery ones ("Why us", "What we do", "Visit us"). Match: "Still
   every bit you." / "Results that look like you, only more you."
+- **BAN the "Real ___, real ___" template and its fragments.** The generator overuses
+  "Real people, real results" and then mutates it into standalone nonsense like "Real
+  hands" or "Real legs" — which is unsettling (it implies the alternative is FAKE hands).
+  Never pair "Real" with a body part or tool. Write a plain human section header instead.
+- **No cutesy body-part metaphors as headlines.** "Lighter legs", "around your face",
+  etc. read as things no real person would say and are faintly creepy. A headline must
+  be a sentence the owner could say out loud to a client without cringing — plain,
+  warm, and about the person's experience, not a pun on their anatomy.
+- Every headline test: would a real, grounded owner actually SAY this to a customer? If
+  it sounds like a slogan, a riddle, or a body-part pun, cut it and say the plain thing.
 
 ## Honesty (never trade this for polish)
 - State only the facts in LOCKED CONTENT. No invented amenities (parking, refreshments,

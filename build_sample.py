@@ -4,7 +4,9 @@ Quality engine per sample-design-system.md: image ladder, per-niche art
 direction, layout archetypes, gap-fixing, multi-pass generate -> critique.
 Publishing = writing samples_cache/<slug>/index.html for serve_samples.py.
 """
+import base64
 import hashlib
+import itertools
 import json
 import logging
 import re
@@ -31,10 +33,19 @@ MAX_ATTEMPTS = 2          # total generation attempts. Facts are now assembled i
 # The factual scaffolding is honest either way (it's code-assembled). Flip to False
 # before go-live if you want strict fail-closed on any residual flag.
 SHIP_WHEN_FACT_FLAGGED = True
+# An owner's OWN photo must score at least this hero-fit (1-5, from the Haiku vision
+# QC) to LEAD the page. Our qualifier selects businesses worst at visual self-
+# presentation, so a merely-usable (3/5) owner photo as hero is the #1 recurring
+# failure — below this bar, owner photos drop behind clean stock. See select_images.
+OWNER_HERO_MIN = 4
 GEN_MAX_TOKENS = 16000
 EST_GEN_USD = 0.45        # worst-case pre-call estimate (doc 08: estimate from max_tokens)
 FACT_CHECK_USD = 0.03     # cheap Haiku grounding pass; real cost ~0.005
 PHOTO_VISION_USD = 0.02   # cheap Haiku-vision candidate ranking; real cost ~0.01
+BON_JUDGE_USD = 0.08      # one best-of-N pairwise vision comparison (2 samples' shots)
+# Best-of-N (Pillar 1+2): generate N diverse candidates and ship the pairwise-
+# tournament winner. Set in config; 1 = legacy single-shot. See _try_best_of_n.
+BEST_OF_N = config.BEST_OF_N
 
 # where the main subject sits -> the CSS object-position that keeps it in frame
 # after an object-fit:cover crop (the #1 cause of "photo cropped through a face")
@@ -113,16 +124,52 @@ NICHE_BRIEFS = {
         primary_cta="Free consultation",
         imagery="Office, headshots, city skyline",
         stock_query="modern professional office"),
+    "dental": dict(
+        match=("dent", "orthodont", "endodont", "periodont"),
+        mood="Confident, clean, reassuring",
+        palette="Calm blues/teals + white",
+        type_pairing="Rounded, approachable sans",
+        leading_section="Hero + trust markers (insurance, new-patient)",
+        primary_cta="Request appointment",
+        imagery="A genuine healthy smile; a professionally-dressed dentist/team; a "
+                "warm dentist-with-patient moment; a bright welcoming reception",
+        stock_query="happy healthy smile dental patient",
+        # clinical service terms ("dental implants") return cold surgical stock, so
+        # skip the service-led query and use the curated warm one above
+        avoid_service_query=True,
+        # their OWN photo only LEADS the page if it's really good (a 5); a merely-good
+        # 4 still gets USED in a section (see select_images) — Austin's rule
+        hero_lead_min=5,
+        mix_sources=True,
+        hero_guidance=(
+            "This is a DENTAL practice. Best hero: a well-shot, genuine HEALTHY SMILE "
+            "(a happy patient or a bright, confident smile). Also strong: a "
+            "professionally-dressed, approachable dentist or team; a warm "
+            "dentist-with-smiling-patient moment; a bright, welcoming reception. "
+            "POOR hero (score hero=1, treat it like a storefront) — the 'surgery "
+            "look': masked or gowned faces, gloved hands in a mouth, a dentist "
+            "HOLDING A DRILL or using instruments, procedure/operatory close-ups, or "
+            "bare clinical equipment. A dentist dressed up is good; a dentist holding "
+            "a drill is not.")),
     "medical": dict(
-        match=("dent", "orthodont", "medical", "chiro", "vet", "clinic",
+        match=("medical", "chiro", "vet", "clinic",
                "physical_therap", "doctor", "wellness"),
         mood="Clean, reassuring, modern",
         palette="Calm blues/teals + white",
         type_pairing="Rounded, approachable sans",
         leading_section="Hero + trust markers (insurance, new-patient)",
         primary_cta="Request appointment",
-        imagery="Clean office, friendly staff, patients",
-        stock_query="modern medical clinic"),
+        imagery="Warm and patient-facing: friendly staff, happy patients, a bright "
+                "welcoming space",
+        stock_query="friendly doctor with happy patient",
+        avoid_service_query=True,
+        hero_guidance=(
+            "This is a patient-facing medical practice. Best heroes are WARM and "
+            "human: a happy patient, a professionally-dressed, approachable clinician "
+            "or team, or a bright welcoming reception. POOR hero (score hero=1) — the "
+            "'surgery/procedure look': masked or gowned figures, gloved hands "
+            "mid-procedure, instruments/needles, or bare clinical equipment. A "
+            "clinician dressed up is good; one mid-procedure is not.")),
     "fitness": dict(
         match=("gym", "fitness", "yoga", "martial", "crossfit", "pilates",
                "studio"),
@@ -337,6 +384,32 @@ def _stock_id(url: str) -> str:
     return m.group(1) if m else url
 
 
+def _img_fingerprint(url: str) -> str:
+    """A stable per-photo key that survives URL drift, so a photo a human rejected on
+    a prior build can be excluded from the rebuild even if its resolved URL changes.
+    Reuses the stock id for Pexels/Unsplash; for Google lh3 photo URLs the long token
+    in the path is stable across re-resolutions of the same photo reference."""
+    sid = _stock_id(url)
+    if sid != url:
+        return sid
+    m = re.search(r"/(?:place-photos|places|photos|p|proxy)/([A-Za-z0-9_\-]{16,})", url)
+    return m.group(1)[:80] if m else url
+
+
+def _images_used_in_build(slug: str) -> set[str]:
+    """Fingerprints of every <img> a prior build placed — used to exclude photos a
+    human reviewer rejected from the next rebuild of the same lead."""
+    if not slug:
+        return set()
+    p = config.SAMPLES_CACHE_DIR / slug / "index.html"
+    if not p.is_file():
+        return set()
+    html = p.read_text(encoding="utf-8", errors="ignore")
+    return {_img_fingerprint(u)
+            for u in re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I)
+            if u.startswith("http")}
+
+
 def _used_stock() -> set[str]:
     try:
         return set(json.loads(STOCK_USED_FILE.read_text(encoding="utf-8")))
@@ -370,86 +443,205 @@ def _dedupe_pool(urls: list[str], lead, limit: int) -> list[str]:
     return pool[:limit]
 
 
-def stock_images(lead, brief: dict, limit: int = 8) -> list[str]:
+def _stock_queries(brief: dict, services: list[str]) -> list[str]:
+    """Ordered search queries, most-specific first. A business's REAL services
+    (e.g. 'Botox, dermal filler') make a far better query than a generic niche
+    word ('spa treatment room', which returns saunas for an injectables clinic).
+    The generic niche query stays as a fallback so an over-narrow service term
+    that returns nothing can't zero out the whole stock rung."""
+    generic = brief.get("stock_query") or "modern small business"
+    queries = []
+    # some niches (dental/medical) have CLINICAL service terms ("dental implants")
+    # that return cold surgical/lab stock, not warm patient-facing photos — for those
+    # the brief sets avoid_service_query, so we lean on the curated warm generic query.
+    if services and not brief.get("avoid_service_query"):
+        # the 1-2 most specific real services, as a natural image query
+        specific = " ".join(services[:2]).strip()
+        if specific and specific.lower() not in generic.lower():
+            queries.append(specific)
+    queries.append(generic)
+    return queries
+
+
+def _pexels_search(query: str) -> list[str]:
+    try:
+        r = requests.get(
+            "https://api.pexels.com/v1/search",
+            params={"query": query, "per_page": 80,
+                    "orientation": "landscape", "size": "large"},
+            headers={"Authorization": config.PEXELS_API_KEY}, timeout=15)
+        if r.status_code == 200:
+            urls = [p["src"]["large2x"] for p in r.json().get("photos", [])
+                    if p.get("width", 0) >= 1200 and p.get("src", {}).get("large2x")]
+            if not urls:
+                log.warning("pexels: 0 usable results for %r", query)
+            return urls
+        log.warning("pexels HTTP %s for %r: %s", r.status_code, query, r.text[:120])
+    except requests.RequestException:
+        log.warning("pexels search failed for %r", query)
+    return []
+
+
+def _unsplash_search(query: str) -> list[str]:
+    try:
+        r = requests.get(
+            "https://api.unsplash.com/search/photos",
+            params={"query": query, "per_page": 30, "orientation": "landscape",
+                    "client_id": config.UNSPLASH_ACCESS_KEY}, timeout=15)
+        if r.status_code == 200:
+            return [p["urls"]["regular"] for p in r.json().get("results", [])
+                    if p.get("urls", {}).get("regular")]
+    except requests.RequestException:
+        log.warning("unsplash search failed for %r", query)
+    return []
+
+
+def stock_images(lead, brief: dict, limit: int = 8,
+                 services: list[str] | None = None) -> list[str]:
     """Ladder step 3 — free niche stock (Pexels, then Unsplash). Both APIs are
     $0; a clean stock photo beats a typographic hero every time. Returns
     CANDIDATES (up to `limit`) — the generator picks the few that fit the
     palette/mood, so more choices = better odds of an on-brand hero. Returns []
     when no key is configured or nothing landscape/large comes back.
 
-    Fetches a LARGE pool and dedupes against photos other samples already used
-    (see _dedupe_pool) so no two samples share stock photos."""
-    query = brief.get("stock_query") or "modern small business"
-    if config.PEXELS_API_KEY:
-        try:
-            r = requests.get(
-                "https://api.pexels.com/v1/search",
-                params={"query": query, "per_page": 80,
-                        "orientation": "landscape", "size": "large"},
-                headers={"Authorization": config.PEXELS_API_KEY}, timeout=15)
-            if r.status_code == 200:
-                urls = [p["src"]["large2x"] for p in r.json().get("photos", [])
-                        if p.get("width", 0) >= 1200 and p.get("src", {}).get("large2x")]
-                if urls:
-                    return _dedupe_pool(urls, lead, limit)
-                log.warning("pexels: 0 usable results for %r", query)
-            else:
-                log.warning("pexels HTTP %s for %r: %s", r.status_code, query,
-                            r.text[:120])
-        except requests.RequestException:
-            log.warning("pexels search failed for %r", query)
-    if config.UNSPLASH_ACCESS_KEY:
-        try:
-            r = requests.get(
-                "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": 30, "orientation": "landscape",
-                        "client_id": config.UNSPLASH_ACCESS_KEY}, timeout=15)
-            if r.status_code == 200:
-                urls = [p["urls"]["regular"] for p in r.json().get("results", [])
-                        if p.get("urls", {}).get("regular")]
-                if urls:
-                    return _dedupe_pool(urls, lead, limit)
-        except requests.RequestException:
-            log.warning("unsplash search failed for %r", query)
+    Tries a service-specific query first (see _stock_queries), then the generic
+    niche query. Fetches a LARGE pool and dedupes against photos other samples
+    already used (see _dedupe_pool) so no two samples share stock photos."""
+    for query in _stock_queries(brief, services or []):
+        if config.PEXELS_API_KEY:
+            urls = _pexels_search(query)
+            if urls:
+                return _dedupe_pool(urls, lead, limit)
+        if config.UNSPLASH_ACCESS_KEY:
+            urls = _unsplash_search(query)
+            if urls:
+                return _dedupe_pool(urls, lead, limit)
     return []
 
 
-def select_images(conn, lead, profile: dict, brief: dict) -> tuple[list[str], str]:
-    """Image source ladder; returns (urls, image_source)."""
+def select_images(conn, lead, profile: dict, brief: dict, service_desc: str = "",
+                  services: list[str] | None = None,
+                  exclude: set[str] | None = None) -> tuple[list[str], str, dict]:
+    """Image source ladder; returns (urls, image_source, image_notes).
+
+    Content-quality gates the SOURCE, not just aspect ratio. Each rung's
+    candidates go through the Haiku vision QC (describe_and_rank_images), which
+    drops low-quality and wrong-service photos; only if survivors remain does
+    that rung win. So a business whose only real photos are a parking lot or a
+    sauna falls through to clean stock instead of shipping the bad photo — the
+    old ladder locked onto 'places' on aspect ratio alone and could never
+    recover. Returns the survivor URLs (best-hero-first) plus their vision notes
+    so build_one doesn't re-run the QC."""
+    ban = exclude or set()
+
+    hero_guidance = brief.get("hero_guidance", "")
+
+    def qc(urls: list[str], source: str) -> tuple[list[str], dict]:
+        # drop photos a human reviewer rejected on a prior build of this lead, so the
+        # same hero physically can't return — the rung falls through to a fresh source
+        urls = [u for u in urls if _img_fingerprint(u) not in ban]
+        ordered, notes = describe_and_rank_images(
+            conn, lead, urls, source, service_desc, hero_guidance)
+        survivors = [u for u in ordered if notes.get(u, {}).get("use", True)]
+        return survivors, notes
+
+    # Two DIFFERENT bars: a photo is USABLE (belongs on the page) at OWNER_HERO_MIN,
+    # but only LEADS the page as the hero at `lead_min` — for most niches these are the
+    # same (4), but dental sets hero_lead_min=5 so a good-not-great owner photo still
+    # gets used in a section while the hero comes from the best available smile.
+    lead_min = brief.get("hero_lead_min", OWNER_HERO_MIN)
+
+    def strong_hero(survivors: list[str], notes: dict, min_hero: int) -> bool:
+        # is at least one survivor a GENUINELY good hero (not merely usable)?
+        return bool(survivors) and max(
+            (notes.get(u, {}).get("hero") or 0) for u in survivors) >= min_hero
+
+    # Adverse selection: our qualifier ("bad/no website") systematically picks the
+    # businesses WORST at visual self-presentation, so their own Google/site photos
+    # make poor heroes far more often than not (Austin's "same bad hero keeps coming
+    # back"). So owner photos only LEAD the page when one is a genuinely strong hero;
+    # otherwise they drop to a last-resort behind clean stock, which beats a mediocre
+    # owner selfie/close-up/parking-lot as the hero. Set aside any QC survivors as a
+    # fallback so we still prefer a real (if weak) photo over a bare typographic hero.
+    owner_backup: tuple[list[str], dict] | None = None
+
+    # rung 1: their OWN photos (authentic beats stock) — but only if one is a strong hero.
     ranked = rank_photos(profile)
-    # never LEAD with a logo-shaped/portrait photo — if that's all they have,
-    # prefer clean stock for the hero (doc: "clean stock beats a real ugly one")
-    hero_worthy = [p for p in ranked if _photo_rank(p) <= 2]
-    if hero_worthy:
+    if ranked:
         photos = places_photo_urls(conn, [p["ref"] for p in ranked])
         if photos:
-            return photos, "places"
-    if lead["qualify_status"] == "OUTDATED":
+            survivors, notes = qc(photos, "places")
+            if strong_hero(survivors, notes, lead_min):
+                return survivors, "places", notes
+            if survivors:
+                owner_backup = (survivors, notes)
+    # rung 2: an OUTDATED site's own images (same owner-photo bar)
+    if owner_backup is None and lead["qualify_status"] == "OUTDATED":
         imgs = site_images(lead["existing_website"])
         if imgs:
-            return imgs, "their_site"
-    stock = stock_images(lead, brief)
+            survivors, notes = qc(imgs, "their_site")
+            if strong_hero(survivors, notes, lead_min):
+                return survivors, "their_site", notes
+            if survivors:
+                owner_backup = (survivors, notes)
+    # rung 3: service-specific stock, also QC'd (a generic pool still returns
+    # wrong-modality shots — the match check filters them). Preferred over a weak
+    # owner photo for the hero.
+    stock = stock_images(lead, brief, services=services)
     if stock:
-        return stock, "stock"
-    if ranked:  # only non-hero-worthy real photos exist; still beat a gradient
-        photos = places_photo_urls(conn, [p["ref"] for p in ranked])
-        if photos:
-            return photos, "places"
-    return [], "typographic"
+        survivors, notes = qc(stock, "stock")
+        if survivors:
+            # mix_sources niches (dental): the owner's photos are usable but none is a
+            # strong-enough HERO, so keep them for supporting sections and let the hero
+            # come from the best smile available (owner or stock) instead of throwing
+            # their real photos away or heroing a mediocre one.
+            if brief.get("mix_sources") and owner_backup:
+                return _merge_owner_stock(owner_backup, (survivors, notes))
+            return survivors, "stock", notes
+    # rung 3.5: no usable stock — fall back to the weak owner photos we set aside
+    # (a real photo the generator can place small still beats a bare gradient hero)
+    if owner_backup:
+        return owner_backup[0], "places", owner_backup[1]
+    # rung 4: nothing usable — the generator uses a typographic hero
+    return [], "typographic", {}
 
 
-def describe_and_rank_images(conn, lead, urls: list[str],
-                             image_source: str) -> tuple[list[str], dict]:
+def _merge_owner_stock(owner: tuple[list[str], dict], stock: tuple[list[str], dict],
+                       limit: int = 6) -> tuple[list[str], str, dict]:
+    """Combine a usable-but-not-hero owner set with stock, best-hero first, so the
+    strongest photo (often a stock smile) leads and the owner's real photos fill the
+    rest. Each note is tagged `own` so the generator can present owner photos as this
+    business's, but never imply a stock photo depicts this specific business."""
+    o_urls, o_notes = owner
+    s_urls, s_notes = stock
+    notes: dict = {}
+    for u in o_urls:
+        notes[u] = {**o_notes.get(u, {}), "own": True}
+    for u in s_urls:
+        notes[u] = {**s_notes.get(u, {}), "own": False}
+    merged = sorted(o_urls + s_urls,
+                    key=lambda u: -(notes[u].get("hero") or 0))[:limit]
+    return merged, "mixed", {u: notes[u] for u in merged}
+
+
+def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
+                             service_desc: str = "",
+                             hero_guidance: str = "") -> tuple[list[str], dict]:
     """Haiku-vision pre-pass. The generator picks photos from URLs it cannot SEE,
     so it once made a clinical gloved-hand close-up the hero. Show the candidates
-    to a cheap vision model, get a one-line description + hero-suitability (1-5)
-    per image, reorder best-hero-first, and hand the descriptions to the generator
-    so it chooses eyes-open (see build_prompt / _render_image_block).
+    to a cheap vision model, get a one-line description + hero-suitability (1-5) +
+    a SERVICE-MATCH verdict per image, reorder best-hero-first, and hand the
+    descriptions to the generator so it chooses eyes-open (see build_prompt /
+    _render_image_block).
 
-    Returns (reordered_urls, {url: {"desc","hero","use"}}). Degrades to
-    (urls, {}) on any failure or when there's nothing to rank — this is an
-    enhancement, never a gate; a build must never fail because of it."""
-    if len(urls) < 2:
+    `service_desc` describes what this business actually does; an image that
+    depicts the WRONG service/setting (a sauna on an injectables clinic) is
+    marked use=false so `select_images` can fall through to a better source.
+
+    Returns (reordered_urls, {url: {"desc","hero","use","focus"}}). Degrades to
+    (urls, {}) on any failure or when there's nothing to rank — a failed vision
+    call must never crash a build (it just skips the extra filtering)."""
+    if not urls:
         return urls, {}
     if costs.check(conn, "claude", PHOTO_VISION_USD) == "block":
         log.warning("claude budget blocked; photo vision rank skipped")
@@ -457,6 +649,21 @@ def describe_and_rank_images(conn, lead, urls: list[str],
     kind = ("licensed stock photos for this industry (NOT the business's own "
             "premises/staff)" if image_source == "stock"
             else "photos associated with this specific business")
+    match_line = (
+        f"\n\nThis business is: {service_desc}. For EACH image also judge SERVICE MATCH — "
+        "does it plausibly depict THIS kind of business/service? An image showing a "
+        "clearly WRONG service or setting (e.g. a sauna, massage table, or body-massage "
+        "room for an injectables/Botox clinic; a gym for a law office; a kitchen for a "
+        "dental office) is a MISMATCH — set 'match': false. When in doubt about a "
+        "generic, on-tone scene (a clean neutral interior, an elegant detail), allow it "
+        "(match=true). A mismatch embarrasses the owner, so be strict about obviously "
+        "wrong modalities." if service_desc else "")
+    # per-niche art direction for the HERO score — e.g. for dental, a healthy smile is
+    # the best hero and a 'surgery look' (drill/mask/instruments) is a poor one. This
+    # OVERRIDES the generic hero notes above where they conflict.
+    hero_line = (f"\n\nNICHE HERO GUIDANCE (apply when scoring 'hero'; it OVERRIDES the "
+                 f"generic hero notes above where they conflict): {hero_guidance}"
+                 if hero_guidance else "")
     content = [{"type": "text", "text":
         f"These are candidate images for a {lead['category'] or 'local business'} "
         f"website ({kind}). For EACH image, judge how well it would work as the large "
@@ -469,20 +676,25 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         "shot; a logo; or an obvious AMATEUR PHONE SNAPSHOT (harsh flash, tilted, messy "
         "background). Also note WHERE the main subject sits in the "
         "frame, so a CSS crop can be aimed to keep it (a wide hero crops off top and "
-        "bottom; a tall column crops off the sides)."}]
+        "bottom; a tall column crops off the sides)." + match_line + hero_line}]
     for i, url in enumerate(urls):
         content.append({"type": "text", "text": f"Image {i+1}:"})
         content.append({"type": "image", "source": {"type": "url", "url": url}})
     content.append({"type": "text", "text":
         "Return STRICT JSON only:\n"
         '{"images": [{"n": 1, "desc": "<=12 words: subject + quality", '
-        '"hero": <1-5 hero suitability>, "use": true|false (does it belong on the '
-        'page at all?), "focus": "top|center|bottom|left|right (where the main '
+        '"hero": <1-5 hero suitability>, "use": true|false (is it good enough quality '
+        'to belong on the page at all?), "match": true|false (does it depict THIS '
+        'business\'s service/setting — true if no service context given), '
+        '"focus": "top|center|bottom|left|right (where the main '
         'subject/face sits, so a crop keeps it in frame)"}, ...]}'})
     try:
         client = _claude()
         resp = client.messages.create(
-            model=config.MODEL_CLASSIFIER, max_tokens=500,
+            # scale with the pool: each image needs ~130 tokens of JSON (desc +
+            # hero + use + match + focus), so a fixed cap truncated 8-image stock
+            # pools into unparseable JSON and the QC silently no-op'd.
+            model=config.MODEL_CLASSIFIER, max_tokens=min(2000, 300 + 140 * len(urls)),
             system="You are a photo editor for premium web design. Be blunt about quality.",
             messages=[{"role": "user", "content": content}],
         )
@@ -494,7 +706,9 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         conn.commit()
         data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
     except (AttributeError, json.JSONDecodeError):
-        log.warning("photo vision rank unparseable; keeping original order")
+        trunc = " (response hit max_tokens — truncated)" if getattr(
+            resp, "stop_reason", None) == "max_tokens" else ""
+        log.warning("photo vision rank unparseable%s; keeping original order", trunc)
         return urls, {}
     except Exception:
         log.exception("photo vision rank failed; keeping original order")
@@ -504,10 +718,12 @@ def describe_and_rank_images(conn, lead, urls: list[str],
         n = _as_int(item.get("n"))
         if 1 <= n <= len(urls):
             foc = str(item.get("focus") or "center").lower()
+            # a wrong-service photo is unusable regardless of how pretty it is
+            usable = bool(item.get("use", True)) and bool(item.get("match", True))
             notes[urls[n - 1]] = {
                 "desc": str(item.get("desc") or "")[:120],
                 "hero": _as_int(item.get("hero")),
-                "use": bool(item.get("use", True)),
+                "use": usable,
                 "focus": foc if foc in FOCUS_CSS else "center",
             }
     if not notes:
@@ -807,11 +1023,12 @@ def _call_claude(conn, system: str, user, lead_id: int,
     return resp.content[0].text
 
 
-# DESIGN-LANGUAGE MENU — distilled from the three reference med-spa sites Austin
-# picked (marasmedspa / medspafm / navamedicalspa). Rotated one-per-lead so samples
-# STOP converging on the same warm-blush-serif-centered template (his "they all feel
-# template" note). Each is a distinct, committed aesthetic. Design DNA only — never
-# their content/photos/brand. A real brand palette (OUTDATED leads) still overrides.
+# DESIGN-LANGUAGE MENU — distilled from reference med-spa sites Austin picked
+# (1-3: marasmedspa / medspafm / navamedicalspa; 4: milan / laseraway / rejuve).
+# Rotated one-per-lead so samples STOP converging on the same warm-blush-serif-centered
+# template (his "they all feel template" note). Each is a distinct, committed aesthetic.
+# Design DNA only — never their content/photos/brand. A real brand palette (from the
+# lead's own existing site) still OVERRIDES the language palette — see _render_design_language.
 DESIGN_LANGUAGES = (
     {   # 1. DARK LUXE (maras) — restrained, gold-on-charcoal, editorial
         "name": "Dark Luxe",
@@ -831,8 +1048,8 @@ DESIGN_LANGUAGES = (
         "palette": "warm mocha/clay (#8f6e56) + soft rose-clay (#d1a394) + warm cream "
                    "whites; a brown/clay accent used decisively in one full-bleed band",
         "type": "a high-contrast serif display that MIXES an italic serif line with an "
-                "UPPERCASE serif line (e.g. \"Flower Mound's / PREMIER MED SPA\"), "
-                "UPPERCASE kicker labels, clean sans body",
+                "UPPERCASE serif line (e.g. an italic phrase set above a bold UPPERCASE "
+                "line), UPPERCASE kicker labels, clean sans body",
         "layout": "ASYMMETRIC and editorial — LEFT-aligned hero text over a full-bleed "
                   "image; a welcome section that SPLITS image on one side, text + a 2×2 "
                   "feature-card cluster on the other; services as a clean list separated "
@@ -850,6 +1067,25 @@ DESIGN_LANGUAGES = (
                   "image blocks that bleed off one edge; a single bold accent divider band; "
                   "very few boxed cards; oversized type carrying the hierarchy instead of borders",
         "motion": "subtle scroll-reveal fades; minimal, calm hover states"},
+    {   # 4. CLINICAL MODERN (milan / laseraway / rejuve) — confident teal, big scale,
+        # bold stat band. The premium modern-clinic look, NOT a soft blush spa.
+        "name": "Clinical Modern",
+        "palette": "confident and clean: a deep TEAL accent (#00698a / #0d7d8f) with warm "
+                   "CREAM (#f3efe7) section backgrounds, crisp white, and deep navy/charcoal "
+                   "text; rounded PILL buttons in the teal accent — reads like a modern "
+                   "clinic, never a soft pastel spa",
+        "type": "DRAMATIC scale contrast: a huge headline pairing an elegant ITALIC SERIF "
+                "display accent word (Playfair/Cormorant-style) with a heavy geometric SANS "
+                "(Jost/Poppins-style), above a tiny UPPERCASE letter-spaced kicker; clean "
+                "sans body. The size jump from kicker to headline is the whole effect",
+        "layout": "a full-bleed photo hero with a scrim and elegant overlaid headline + one "
+                  "teal pill CTA; then a SPLIT welcome section (kicker + big headline + pill "
+                  "on one side, full-height photo on the other); a BOLD STAT BAND of 2-4 big "
+                  "numbers with small labels (REAL numbers only — e.g. Google rating + review "
+                  "count from LOCKED CONTENT, never invented); a clean service grid or "
+                  "hairline-divided list. No two adjacent sections share a layout",
+        "motion": "IntersectionObserver scroll-reveal + hover-lift + COUNT-UP animation on "
+                  "the stat-band numbers as it scrolls into view + gentle image hover-zoom"},
 )
 
 
@@ -890,11 +1126,24 @@ def _render_image_block(images: list[str], image_source: str,
         if image_source == "stock":
             fit = f" [hero-fit {nt['hero']}/5]" if nt.get("hero") else ""
             lines.append(f"  {i+1}. {url}{fit}{avoid}{desc}{pos}")
+        elif image_source == "mixed":
+            # per-image provenance: owner photos may be shown as theirs; stock may not
+            src = "their OWN photo" if nt.get("own") else ("stock — atmosphere only, "
+                  "do NOT imply it depicts this business")
+            role = "hero" if i == 0 else "supporting"
+            fit = f", hero-fit {nt['hero']}/5" if nt.get("hero") else ""
+            lines.append(f"  {i+1}. {url}  (role: {role}{fit}; {src}){avoid}{desc}{pos}")
         else:
             role = "hero" if i == 0 else "supporting"
             fit = f", hero-fit {nt['hero']}/5" if nt.get("hero") else ""
             lines.append(f"  {i+1}. {url}  (role: {role}{fit}){avoid}{desc}{pos}")
     block = "\n".join(lines)
+    if image_source == "mixed":
+        block += (
+            "\n  MIXED SOURCES: photos marked 'their OWN photo' really are this "
+            "business's — present them as such. Photos marked 'stock' are licensed "
+            "industry stock — use them as atmosphere and NEVER caption or imply they "
+            "depict this specific business, its staff, or its premises.")
     if image_source == "stock":
         block += (
             "\n  These are stock CANDIDATES — CHOOSE the 1-3 whose lighting, tones and "
@@ -1137,13 +1386,26 @@ techniques to actually reach premium:
 - CONFIDENT color: deploy the brand accent decisively (e.g. one full-bleed accent band or
   section), not timid gray-on-white throughout — but don't flood every section either.
 - TASTEFUL MOTION — this is what makes a page feel alive instead of flat, and it is
-  expected, not optional. Two things: (a) SCROLL-REVEAL: sections and cards start slightly
-  lowered and faded (opacity:0; transform: translateY(20px)) and ease to full
-  (opacity:1; translateY(0)) as they enter the viewport, driven by ONE small
-  IntersectionObserver script near </body>; (b) HOVER-LIFT: cards, service tiles, and
-  buttons rise on hover (transform: translateY(-4px) plus a stronger box-shadow) over a
-  ~150-250ms transition. Keep it subtle and quick — never bouncy, spinning, parallax, or
-  slow. MUST honor prefers-reduced-motion: reduce (no transforms/animation when set).
+  expected, not optional. Premium reference sites are RICH with subtle motion; a static
+  page reads cheap. Do ALL of these, driven by vanilla JS/CSS only (the page is a single
+  self-contained file — NO external libraries/CDNs):
+  (a) SCROLL-REVEAL: sections and cards start slightly lowered and faded (opacity:0;
+      transform: translateY(20px)) and ease to full as they enter the viewport, driven by
+      ONE small IntersectionObserver near </body>; stagger cards in a row by ~80ms.
+  (b) HOVER-LIFT: cards, service tiles, and buttons rise on hover (transform:
+      translateY(-4px) + stronger shadow) over ~150-250ms.
+  (c) COUNT-UP STATS: ONLY build a numeric stat band if you have REAL numbers from LOCKED
+      CONTENT (e.g. the Google rating + review count). NEVER render a stat with 0 or a
+      placeholder — if you don't have a real number, omit that stat (or the whole band).
+      The real final value MUST be the element's static HTML text (e.g. <span>4.9</span>);
+      the JS only animates it UPWARD to that value on scroll-in, and MUST restore/leave the
+      real value if scripts don't run or prefers-reduced-motion is set. A stat frozen at 0
+      reads as broken — the number a visitor sees with JS off must always be the real one.
+  (d) IMAGE HOVER-ZOOM: photos in cards/galleries scale gently (transform: scale(1.04))
+      inside an overflow:hidden frame on hover.
+  Keep everything subtle and quick — never bouncy, spinning, parallax, auto-playing, or
+  slow. MUST honor prefers-reduced-motion: reduce (no transforms/animation when set;
+  counters jump straight to the final value).
 Aim for something the owner would be proud to show off, not a page that reads as generic.
 
 Required sections: a hero (per HERO above), services (if LOCKED CONTENT lists REAL
@@ -1178,6 +1440,11 @@ spots destroys all trust in the pitch, so treat this as harder than any design r
 - Days / hours: state the hours EXACTLY as the LOCKED HOURS list; the business is open
   EXACTLY {open_days} day(s) per week — never count or infer a different number.
 - COPY VOICE (judged hard — write like a real, warm, grounded person, NOT a brochure):
+  * ENGLISH ONLY: write ALL visible copy in English — headline, taglines, section
+    intros, labels, buttons, alt text, and the <html lang> attribute (lang="en").
+    This holds even when the business NAME or its listed services are in another
+    language (e.g. Spanish); keep the name itself verbatim, but never render the page
+    bilingual or in that language. No Spanish (or other non-English) sentences anywhere.
   * NATURAL & CALM: short, confident sentences a native English speaker would actually
     say. Read each line aloud — if it sounds stiff, translated, ESL-ish, or like filler,
     rewrite it. Relaxed and warm, never salesy or breathless.
@@ -1199,7 +1466,7 @@ spots destroys all trust in the pitch, so treat this as harder than any design r
 Return only the HTML, nothing else."""
 
 
-CRITIQUE_KEYS = ("bespoke", "hero", "craft", "real", "imagery", "beats", "mobile")
+CRITIQUE_KEYS = ("bespoke", "hero", "craft", "real", "voice", "imagery", "beats", "mobile")
 
 
 def critique(conn, lead, html: str, image_source: str = "") -> tuple[bool, str, bool]:
@@ -1223,9 +1490,20 @@ RUBRIC (score each 1-5):
 THE BUSINESS: {lead['business_name']} ({lead['category']})
 THE WEAKNESS THIS MUST FIX: {lead['qualify_reason'] or 'no web presence'}{imagery_note}
 
+COPY VOICE CHECK (score "voice") — read EVERY headline and tagline aloud and ask:
+would a real, grounded business owner actually SAY this to a customer? Score voice LOW
+(1-2) and add a specific fix for ANY of these:
+  - a "Real ___, real ___" template OR its fragments ("Real hands", "Real legs",
+    "Real results") — unsettling and formulaic;
+  - a body-part pun or cutesy metaphor as a headline ("Lighter legs", "around your face");
+  - slogan/riddle lines that sound like ad-copy, not a person ("elevate your journey",
+    "your journey to ...", "the kind of attention that feels personal");
+  - anything stiff, translated, ESL-ish, or hollow.
+Good voice sounds like a warm person: "Come in, relax, and leave feeling like yourself."
+
 Return STRICT JSON only, scoring EXACTLY these keys:
-{{"verdict": "PASS" or "FAIL", "scores": {{"bespoke": n, "hero": n, "craft": n, "real": n, "imagery": n, "beats": n, "mobile": n}}, "fixes": ["specific fix", ...]}}
-FAIL if any of bespoke / hero / craft / beats / mobile / imagery scores below 4.
+{{"verdict": "PASS" or "FAIL", "scores": {{"bespoke": n, "hero": n, "craft": n, "real": n, "voice": n, "imagery": n, "beats": n, "mobile": n}}, "fixes": ["specific fix", ...]}}
+FAIL if any of bespoke / hero / craft / voice / beats / mobile / imagery scores below 4.
 Even on PASS, list the fixes that would lift any 4 to a 5.
 
 HTML:
@@ -1515,22 +1793,271 @@ def extract_html(raw: str) -> str:
     return text[start:].strip() if start != -1 else text.strip()
 
 
+def _ship_sample(conn, lead, html: str, image_source: str,
+                 fact_flag_note: str | None = None) -> bool:
+    """Persist a finished sample and transition the lead to SAMPLE_BUILT — the
+    shared tail for both the single-shot and best-of-N build paths."""
+    slug = unique_slug(conn, lead)
+    out_dir = config.SAMPLES_CACHE_DIR / slug
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "index.html").write_text(html, encoding="utf-8")
+    # remember which stock photos this sample actually placed, so the next build
+    # picks different ones (no repeated stock across samples)
+    if image_source in ("stock", "mixed"):
+        remember_stock(re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I))
+    url = f"{config.SAMPLE_BASE_URL}/{slug}"
+    notes = fact_flag_note
+    try:
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            notes = f"{notes + '; ' if notes else ''}url_unverified ({r.status_code})"
+    except requests.RequestException:
+        notes = f"{notes + '; ' if notes else ''}url_unverified (tunnel unreachable at build time)"
+    if notes:
+        log.warning("lead %s: %s", lead["id"], notes)
+    db.transition(conn, lead["id"], "SAMPLE_BUILT", f"images={image_source}",
+                  sample_url=url, sample_slug=slug, sample_built_at=db.now(),
+                  image_source=image_source,
+                  notes=notes if notes else lead["notes"])
+    conn.commit()
+    return True
+
+
+# --- Best-of-N (Pillar 1+2): generate a diverse batch, ship the tournament winner --
+# The generator is high-variance: the SAME lead yields a great build and a broken one
+# from identical inputs (headline slapped across a face vs. a clean split hero). The
+# single-shot path shipped whatever one draw produced. Best-of-N instead draws N
+# candidates (one per design language), renders each, and ships the one a pairwise
+# vision judge picks — turning that variance from a liability into a selection asset.
+# Validated in calibration: a pairwise judge picked the human-preferred build 4/4 on
+# real dental pairs, order-invariant. Absolute 1-5 scoring did NOT (it called human
+# 1s a 6); pairwise "which is better?" is the reliable form, so the tournament asks that.
+
+BON_JUDGE_PROMPT = (
+    "Two AI-generated SAMPLE homepages for the SAME local business ({biz}), each built "
+    "to win them as a cold-outreach client. Sample A first (desktop fold, then full "
+    "page), then sample B (fold, then full page).\n\n"
+    "Pick the one that would best make the OWNER stop, think \"that's my business, but "
+    "better,\" and reply to the email. Judge, in priority order:\n"
+    "- HERO in the first 3 seconds, and whether the hero PHOTO is an asset or a "
+    "liability. Asset: a warm, appealing, on-brand image that fits THIS business. "
+    "Liability: a wrong-modality photo, a dim/dated/cluttered shot, a bare clinical or "
+    "storefront/parking shot, a posed stock model that reads fake, or headline text "
+    "laid across a person's face.\n"
+    "- DESIGN CRAFT: premium and designed vs. a flat template ('clean but plain' loses).\n"
+    "- COPY that sounds written for THIS business, not filler.\n"
+    "- CREDIBILITY through the owner's eyes: nothing embarrassing or overclaimed.\n\n"
+    "Return STRICT JSON only: {{\"winner\":\"A\" or \"B\",\"reason\":\"<the single deciding "
+    "factor, <=18 words>\"}}")
+
+
+def _render_two(browser, uri: str) -> dict:
+    """Desktop fold + full-page JPEG bytes for one candidate (reduced-motion so
+    scroll-reveal sections are settled, not captured mid-fade as blank blocks)."""
+    shots = {}
+    for label, full in (("fold", False), ("full", True)):
+        page = browser.new_page(viewport={"width": 1280, "height": 860},
+                                reduced_motion="reduce")
+        try:
+            page.goto(uri, wait_until="networkidle", timeout=45_000)
+            page.wait_for_timeout(900)
+            if full:
+                h = min(page.evaluate("document.body.scrollHeight"), 4200)
+                shots[label] = page.screenshot(type="jpeg", quality=58, full_page=True,
+                                               clip={"x": 0, "y": 0, "width": 1280, "height": h})
+            else:
+                shots[label] = page.screenshot(type="jpeg", quality=62, full_page=False)
+        finally:
+            page.close()
+    return shots
+
+
+def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> str:
+    """Ask the vision judge which of two rendered candidates is better. Returns
+    'a' or 'b' (defaults to 'a' on any parse/API failure — a stable, harmless tie-break)."""
+    biz = f"{lead['business_name']} ({lead['category'] or 'local business'})"
+
+    def _imgs(shots):
+        return [{"type": "image", "source": {"type": "base64",
+                 "media_type": "image/jpeg", "data": base64.b64encode(b).decode()}}
+                for b in (shots.get("fold"), shots.get("full")) if b]
+
+    content = [{"type": "text", "text": BON_JUDGE_PROMPT.format(biz=biz)},
+               {"type": "text", "text": "=== SAMPLE A — fold ==="}, *_imgs({"fold": shots_a.get("fold")}),
+               {"type": "text", "text": "=== SAMPLE A — full page ==="}, *_imgs({"full": shots_a.get("full")}),
+               {"type": "text", "text": "=== SAMPLE B — fold ==="}, *_imgs({"fold": shots_b.get("fold")}),
+               {"type": "text", "text": "=== SAMPLE B — full page ==="}, *_imgs({"full": shots_b.get("full")})]
+    try:
+        client = _claude()
+        resp = client.messages.create(
+            model=config.MODEL_QUALITY, max_tokens=200,
+            system="You are a decisive, brutally honest design director grading sample "
+                   "websites for a cold-outreach pipeline. Judge like a picky business owner.",
+            messages=[{"role": "user", "content": content}])
+        costs.record(conn, "claude", "sample_bon_judge",
+                     costs.claude_cost(config.MODEL_QUALITY, resp.usage.input_tokens,
+                                       resp.usage.output_tokens),
+                     lead_id=lead["id"], tokens_in=resp.usage.input_tokens,
+                     tokens_out=resp.usage.output_tokens)
+        conn.commit()
+        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+        winner = "b" if str(data.get("winner", "A")).strip().upper().startswith("B") else "a"
+        log.info("lead %s judge: %s (%s)", lead["id"], winner.upper(),
+                 str(data.get("reason", ""))[:120])
+        return winner
+    except Exception:
+        log.exception("lead %s pairwise judge failed; defaulting to A", lead["id"])
+        return "a"
+
+
+def _tournament(conn, lead, htmls: list[str]) -> int:
+    """Render every candidate and run a round-robin pairwise tournament; return the
+    index of the candidate with the most wins (ties -> lowest index). Raises on a
+    Playwright/render failure so the caller can fall back."""
+    from playwright.sync_api import sync_playwright  # laptop-only
+    tmp = config.LOGS_DIR / "bon"
+    tmp.mkdir(parents=True, exist_ok=True)
+    shots: dict[int, dict] = {}
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        try:
+            for i, html in enumerate(htmls):
+                f = tmp / f"{lead['id']}_{i}.html"
+                f.write_text(html, encoding="utf-8")
+                shots[i] = _render_two(browser, f.as_uri())
+        finally:
+            browser.close()
+    wins = {i: 0 for i in range(len(htmls))}
+    for a, b in itertools.combinations(range(len(htmls)), 2):
+        if costs.check(conn, "claude", BON_JUDGE_USD) == "block":
+            log.warning("lead %s: budget blocked mid-tournament", lead["id"])
+            break
+        winner = _pairwise_pick(conn, lead, shots[a], shots[b])
+        wins[a if winner == "a" else b] += 1
+    log.info("lead %s tournament wins: %s", lead["id"], wins)
+    return max(range(len(htmls)), key=lambda i: (wins[i], -i))
+
+
+def _try_best_of_n(conn, lead, *, brief, brand, site_facts, services, profile,
+                   source_text, content, images, image_source, image_notes,
+                   allowed_images, system, feedback_seed) -> bool | None:
+    """Generate BEST_OF_N diverse candidates and ship the tournament winner.
+
+    Returns True/False when it produces a definitive build outcome, or None to tell
+    build_one to fall back to the single-shot loop — used when Playwright is missing
+    (the VM) or when too few candidates clear the structural gate to select among."""
+    try:
+        import playwright.sync_api  # noqa: F401 — VM lacks it; degrade to single-shot
+    except Exception:
+        return None
+    start = int(hashlib.sha1(str(lead["id"]).encode()).hexdigest(), 16) % len(DESIGN_LANGUAGES)
+    n = min(BEST_OF_N, len(DESIGN_LANGUAGES))
+    seed = "\n\n".join(feedback_seed)
+    candidates: list[tuple[str, dict, str]] = []   # (html, design_language, archetype)
+    for i in range(n):
+        dl = DESIGN_LANGUAGES[(start + i) % len(DESIGN_LANGUAGES)]
+        arch = ARCHETYPES[(lead["id"] + i) % len(ARCHETYPES)]
+        base_prompt = build_prompt(lead, brief, arch, images, content, brand,
+                                   image_source, image_notes, dl)
+        raw = _call_claude(conn, system, (base_prompt, seed),
+                           lead["id"], f"sample_generate_bon{i + 1}")
+        if raw is None:
+            break  # budget blocked — stop drawing candidates
+        cand = _scrub_superlatives(extract_html(raw), source_text)
+        if structural_gate(cand, lead, allowed_images, source_text) is None:
+            candidates.append((cand, dl, arch))
+            log.info("lead %s bon cand %d (%s): gate PASS", lead["id"], i + 1, dl["name"])
+        else:
+            log.info("lead %s bon cand %d (%s): gate FAIL", lead["id"], i + 1, dl["name"])
+    if not candidates:
+        return None  # nothing to select — single-shot has retry-with-feedback
+    if len(candidates) == 1:
+        best = 0
+    else:
+        try:
+            best = _tournament(conn, lead, [c[0] for c in candidates])
+        except Exception:
+            log.exception("lead %s: tournament render/judge failed; using first passer",
+                          lead["id"])
+            best = 0
+    winner_html, win_dl, win_arch = candidates[best]
+    log.info("lead %s: best-of-%d winner = cand %d (%s)", lead["id"],
+             len(candidates), best + 1, win_dl["name"])
+
+    # honesty pass on the WINNER only (the tournament already selected for design/hero).
+    # Facts are code-assembled, so a flag here is a rare prose slip — try one targeted
+    # fix, then degrade-not-die (ship flagged for factor-F grading) rather than kill it.
+    fact_ok, fact_fixes = fact_check(conn, lead, profile, winner_html, site_facts)
+    if fact_ok or not fact_fixes:
+        return _ship_sample(conn, lead, winner_html, image_source, None)
+    log.info("lead %s: winner fact-flagged, one fix pass: %s", lead["id"], fact_fixes[:160])
+    fix_fb = list(feedback_seed) + [
+        "FACT-CHECK — your marketing copy stated these claims, which are NOT in LOCKED "
+        "CONTENT and are therefore forbidden. DELETE each one outright (do not soften or "
+        "reword — remove the phrase/sentence):\n" + fact_fixes +
+        "\nRegenerate the COMPLETE page with ALL required sections and the images — remove "
+        "only the flagged claims, keep every LOCKED CONTENT item exactly."]
+    fix_prompt = build_prompt(lead, brief, win_arch, images, content, brand,
+                              image_source, image_notes, win_dl)
+    raw = _call_claude(conn, system, (fix_prompt, "\n\n".join(fix_fb)),
+                       lead["id"], "sample_generate_bon_fix")
+    if raw is not None:
+        fixed = _scrub_superlatives(extract_html(raw), source_text)
+        if structural_gate(fixed, lead, allowed_images, source_text) is None:
+            ok2, fixes2 = fact_check(conn, lead, profile, fixed, site_facts)
+            note = None if ok2 else "fact_flagged: " + fixes2[:180]
+            return _ship_sample(conn, lead, fixed, image_source, note)
+    # fix regressed or was blocked — ship the winner flagged (SHIP_WHEN_FACT_FLAGGED)
+    if SHIP_WHEN_FACT_FLAGGED:
+        return _ship_sample(conn, lead, winner_html, image_source,
+                            "fact_flagged: " + fact_fixes[:180])
+    db.transition(conn, lead["id"], "SAMPLE_FAILED", "fact-check unresolved: " + fact_fixes[:140])
+    conn.commit()
+    return False
+
+
 def build_one(conn, lead) -> bool:
     profile = json.loads(lead["source_profile"] or "{}")
     brief = niche_brief(lead["category"], lead["business_name"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
-    images, image_source = select_images(conn, lead, profile, brief)
-    # vision pre-pass: reorder best-hero-first + describe each so the generator
-    # (which can't see the URLs) chooses eyes-open. No-op if <2 images.
-    images, image_notes = describe_and_rank_images(conn, lead, images, image_source)
     brand = extract_brand(lead["existing_website"]) if lead["existing_website"] else {}
     if brand:
         log.info("lead %s brand: colors=%s fonts=%s logo=%s", lead["id"],
                  brand.get("colors"), brand.get("fonts"), bool(brand.get("logo")))
     # their REAL services + tagline from their own site — the substance that lets the
-    # copy be specific instead of generic mood-filler (strictly sourced; cached per-URL)
+    # copy be specific instead of generic mood-filler (strictly sourced; cached per-URL).
+    # Extracted BEFORE image selection so the real services drive the stock query and
+    # the vision service-match check (a sauna won't slip onto an injectables clinic).
     site_facts = (extract_site_facts(conn, lead, lead["existing_website"])
                   if lead["existing_website"] else {})
+    services = site_facts.get("services") or []
+    # a plain "what this business does" line for the vision QC's service-match verdict;
+    # the name often encodes the modality ("Miss Botox") when there are no listed services
+    service_desc = lead["business_name"] or lead["category"] or "local business"
+    desc_extra = [b for b in (lead["category"],
+                              ("offering " + ", ".join(services[:8])) if services else "")
+                  if b]
+    if desc_extra:
+        service_desc += " (" + "; ".join(desc_extra) + ")"
+    # PER-LEAD LEARNING: read this lead's most recent HUMAN grade and feed it back into
+    # this rebuild. Without this, a hand-grade that says "replace the hero" changes
+    # nothing — build_one starts fresh and re-picks the same photo (Austin's "they aren't
+    # actually learning"). Here we (1) exclude the exact image(s) a low imagery/hero
+    # grade rejected, and (2) surface the reviewer's CHANGE note to the generator below.
+    prior = conn.execute(
+        "SELECT imagery, hero, notes, sample_slug FROM grades WHERE lead_id=? "
+        "ORDER BY id DESC LIMIT 1", (lead["id"],)).fetchone()
+    exclude_imgs: set[str] = set()
+    reviewer_note = (prior["notes"] or "").strip() if prior else ""
+    if prior and ((prior["imagery"] or 5) <= 3 or (prior["hero"] or 5) <= 3):
+        exclude_imgs = _images_used_in_build(prior["sample_slug"])
+        if exclude_imgs:
+            log.info("lead %s: excluding %d reviewer-rejected image(s) from rebuild",
+                     lead["id"], len(exclude_imgs))
+    # image source ladder — content-quality (not just aspect ratio) picks the source;
+    # returns survivor URLs best-hero-first plus the vision notes the generator needs
+    images, image_source, image_notes = select_images(
+        conn, lead, profile, brief, service_desc, services, exclude=exclude_imgs)
     # the real logo is a legitimate image even if it isn't in the photo `images`
     allowed_images = images + ([brand["logo"]] if brand.get("logo") else [])
     # everything we can truthfully say about them — the claim gate allows a banned
@@ -1563,6 +2090,31 @@ def build_one(conn, lead) -> bool:
     base_prompt = build_prompt(lead, brief, archetype, images, content, brand,
                                image_source, image_notes, design_language)
     feedback: list[str] = []
+    # seed the FIRST attempt with the human reviewer's note on the previous version of
+    # THIS page — the highest-signal guidance there is. Any rejected image is already
+    # gone from `images`; this carries the copy/hero/design feedback into generation.
+    if reviewer_note:
+        feedback.append(
+            "A HUMAN REVIEWER graded the PREVIOUS version of THIS EXACT page and gave "
+            "the single most important change to make. Treat it as top priority and do "
+            "NOT repeat the mistake (if it named the hero photo, the rejected image has "
+            "already been removed from your options — pick a different one):\n"
+            + reviewer_note)
+
+    # BEST-OF-N (Pillar 1+2): draw N diverse candidates and ship the pairwise-
+    # tournament winner. Returns None to fall through to the single-shot loop below
+    # (Playwright missing on the VM, or too few candidates cleared the gate to select).
+    if BEST_OF_N > 1:
+        outcome = _try_best_of_n(
+            conn, lead, brief=brief, brand=brand, site_facts=site_facts,
+            services=services, profile=profile, source_text=source_text,
+            content=content, images=images, image_source=image_source,
+            image_notes=image_notes, allowed_images=allowed_images,
+            system=system, feedback_seed=feedback)
+        if outcome is not None:
+            return outcome
+        log.info("lead %s: best-of-N unavailable — single-shot fallback", lead["id"])
+
     html, failure = None, "no attempts made"
     last_valid, last_flags = None, ""   # best gate-passed candidate + its residual flags
     critiqued = False
@@ -1638,33 +2190,7 @@ def build_one(conn, lead) -> bool:
         conn.commit()
         return False
 
-    slug = unique_slug(conn, lead)
-    out_dir = config.SAMPLES_CACHE_DIR / slug
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "index.html").write_text(html, encoding="utf-8")
-
-    # remember which stock photos this sample actually placed, so the next build
-    # picks different ones (no repeated stock across samples)
-    if image_source == "stock":
-        remember_stock(re.findall(r'<img[^>]+src=["\']([^"\']+)', html, re.I))
-
-    url = f"{config.SAMPLE_BASE_URL}/{slug}"
-    notes = fact_flag_note
-    try:
-        r = requests.get(url, timeout=15)
-        if r.status_code != 200:
-            notes = f"{notes + '; ' if notes else ''}url_unverified ({r.status_code})"
-    except requests.RequestException:
-        notes = f"{notes + '; ' if notes else ''}url_unverified (tunnel unreachable at build time)"
-    if notes:
-        log.warning("lead %s: %s", lead["id"], notes)
-
-    db.transition(conn, lead["id"], "SAMPLE_BUILT", f"images={image_source}",
-                  sample_url=url, sample_slug=slug, sample_built_at=db.now(),
-                  image_source=image_source,
-                  notes=notes if notes else lead["notes"])
-    conn.commit()
-    return True
+    return _ship_sample(conn, lead, html, image_source, fact_flag_note)
 
 
 def build_samples(limit: int = 10) -> dict:
