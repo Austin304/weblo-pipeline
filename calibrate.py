@@ -33,6 +33,7 @@ import re
 import config
 import costs
 import db
+import llm
 
 log = logging.getLogger(__name__)
 
@@ -131,9 +132,7 @@ Return STRICT JSON only:
 {{"scores": {{"hero": n, "design": n, "layout": n, "imagery": n, "copy": n, "trust": n, "beats": n}},
  "overall": n, "change_first": "...", "keep": "...", "fixes": ["specific fix", ...]}}"""})
 
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    resp = client.messages.create(
+    resp = llm.create(
         model=config.MODEL_QUALITY, max_tokens=800,
         system="You are a brutally honest design reviewer grading sample "
                "websites for a cold-outreach pipeline.",
@@ -548,9 +547,7 @@ def save_exemplar(lead_id: int):
             print("claude budget blocked")
             return
         html = path.read_text(encoding="utf-8")
-        import anthropic
-        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-        resp = client.messages.create(
+        resp = llm.create(
             model=config.MODEL_QUALITY, max_tokens=900,
             system="You distill what makes a specific web design excellent into "
                    "a reusable brief for generating OTHER sites at the same level.",

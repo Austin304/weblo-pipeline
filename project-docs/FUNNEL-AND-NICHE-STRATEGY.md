@@ -4,6 +4,8 @@
 
 > **Companion doc:** this doc picks *which pond to fish in* (niche, channel, revenue math). The per-lead mechanics — how the pipeline scores and orders leads within a chosen niche — live in `lead-scoring-design.md`.
 
+> **⚠️ Niche update (2026-07-22):** the active niche is now **DENTISTS**, not med spas — see [NICHE.md](../NICHE.md). The med-spa analysis below is kept as historical reasoning; the *method* (pick one visual, email-friendly niche and keep opening territories) still holds, but read "med spas" as "dentists" throughout.
+
 ---
 
 ## Bottom line (read this first)

@@ -1,12 +1,13 @@
 # ============================================================
 # .env template — copy this to a file named ".env" in the repo root.
-# The 9 keys below are BLANK on purpose: fill them from each
+# The secret keys below are BLANK on purpose: fill them from each
 # service's console (this doubles as rotating the old keys).
 # The config values below are pre-filled and safe.
 # ============================================================
 
 # --- SECRET KEYS: fill these yourself (see project-docs) ---
-ANTHROPIC_API_KEY=
+MOONSHOT_API_KEY=              # ACTIVE LLM provider (Kimi): sample builds + email/postcard copy + reply-classify
+ANTHROPIC_API_KEY=             # optional: only used when LLM_PROVIDER=anthropic (A/B flip-back to Claude)
 GOOGLE_PLACES_API_KEY=
 CLOUDFLARE_API_TOKEN=
 TELEGRAM_BOT_TOKEN=
@@ -15,6 +16,8 @@ LOB_API_KEY_LIVE=
 PEXELS_API_KEY=
 
 # --- CONFIG (pre-filled, non-secret) ---
+LLM_PROVIDER=moonshot                # "moonshot" (Kimi, active default) or "anthropic" (Claude, A/B flip-back)
+MOONSHOT_BASE_URL=https://api.moonshot.ai/v1
 CLOUDFLARE_ACCOUNT_ID=5f7a225e1e36eb6a9b8945fe7648791b         # the hex string after dash.cloudflare.com/ in your browser URL
 CLOUDFLARE_TUNNEL_NAME=samples
 SAMPLES_PORT=8788
@@ -22,7 +25,7 @@ SAMPLE_BASE_URL=https://samples.webloapp.com
 TELEGRAM_CHAT_ID=8844809421
 DB_PATH=leads.db
 CAMPAIGN_LOCATION=Dallas, TX
-CAMPAIGN_NICHE=med spas
+CAMPAIGN_NICHE=dentist
 CAMPAIGN_TARGET_COUNT=50
 LOB_MODE=test                  # flip to "live" only after approving a real batch
 MAIL_FROM_NAME=Weblo                # your name / "Weblo"
@@ -36,7 +39,7 @@ MAIL_MONTHLY_BUDGET_USD=100
 POSTCARD_SIZE=4x6
 MAIL_UTM=utm_source=postcard
 PIPELINE_MONTHLY_BUDGET_USD=150   # GLOBAL hard ceiling across ALL paid APIs; pipeline self-pauses at 100%
-CLAUDE_MONTHLY_BUDGET_USD=50      # Anthropic API (sample builds + email/postcard copy + reply classification)
+CLAUDE_MONTHLY_BUDGET_USD=50      # active LLM provider spend (sample builds + email/postcard copy + reply classification); var name is legacy
 PLACES_MONTHLY_BUDGET_USD=20      # Google Places (lead finding)
 ZEROBOUNCE_MONTHLY_BUDGET_USD=10  # email verification (only used if ZEROBOUNCE_API_KEY is set)
 BUDGET_WARN_PCT=80                # Telegram nudge when any envelope crosses this % of its cap

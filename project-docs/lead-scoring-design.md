@@ -36,7 +36,7 @@ entire batch — for free, zero API calls.
 **Which niche to pick is decided in `FUNNEL-AND-NICHE-STRATEGY.md`, not here.** That doc
 filters niches by *channel reachability first* (can I find an email?), then ticket value,
 then how good the sample will look — which is why, e.g., roofers/HVAC are high-ticket but
-belong on the **postcard** track (no findable email), while med spas are the top **email**
+belong on the **postcard** track (no findable email), while dentists are the top **email**
 pick. Don't reduce niche choice to a flat "high-ticket list" — a high-ticket niche you
 can't reach on your free channel will starve the email pipeline.
 

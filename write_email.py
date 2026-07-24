@@ -6,6 +6,7 @@ import re
 import config
 import costs
 import db
+import llm
 
 log = logging.getLogger(__name__)
 
@@ -29,9 +30,7 @@ SYSTEM = "You write short, human cold emails for a freelance local web designer.
 def _call(conn, prompt: str, lead_id: int, operation: str) -> dict | None:
     if costs.check(conn, "claude", EST_EMAIL_USD) == "block":
         return None
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    resp = client.messages.create(
+    resp = llm.create(
         model=config.MODEL_QUALITY, max_tokens=1000, system=SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )

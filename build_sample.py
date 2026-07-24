@@ -19,7 +19,9 @@ from bs4 import BeautifulSoup
 
 import config
 import costs
+import dataset  # Step-0 durable training-data capture (pure instrumentation; non-fatal)
 import db
+import llm
 
 log = logging.getLogger(__name__)
 
@@ -94,16 +96,6 @@ NICHE_BRIEFS = {
         primary_cta="Book service / call",
         imagery="Shop, cars, work in progress",
         stock_query="auto repair shop mechanic"),
-    "beauty": dict(
-        match=("salon", "spa", "barber", "aesthet", "beauty", "nail", "med_spa",
-               "medical_spa", "skin"),
-        mood="Elegant, airy, aspirational",
-        palette="Soft neutrals, blush/sage, lots of whitespace",
-        type_pairing="Serif display + light sans",
-        leading_section="Imagery-forward hero, minimal text",
-        primary_cta="Book appointment",
-        imagery="Interiors, results, clean product shots",
-        stock_query="spa treatment room interior"),
     "food": dict(
         match=("restaurant", "cafe", "bakery", "bar", "pizza", "food", "coffee",
                "diner", "grill"),
@@ -244,7 +236,7 @@ RUBRIC = """- Bespoke, not templated: looks designed for THIS business, and USES
 def niche_key(category: str, name: str = "") -> str:
     # category first (authoritative when specific); the business NAME is the
     # fallback for Places' generic types ("establishment", "point_of_interest")
-    # — e.g. category=establishment, name="Nursing Aesthetic Institute" → beauty
+    # — e.g. category=establishment, name="Park Cities Family Dentistry" → dental
     for text in ((category or "").lower(), (name or "").lower()):
         for key, brief in NICHE_BRIEFS.items():
             if any(m in text for m in brief["match"]):
@@ -465,8 +457,8 @@ def _dedupe_pool(urls: list[str], lead, limit: int) -> list[str]:
 
 def _stock_queries(brief: dict, services: list[str]) -> list[str]:
     """Ordered search queries, most-specific first. A business's REAL services
-    (e.g. 'Botox, dermal filler') make a far better query than a generic niche
-    word ('spa treatment room', which returns saunas for an injectables clinic).
+    (e.g. their real listed services) make a far better query than a generic niche
+    word ('dental office', which returns cold, generic clinical stock).
     The generic niche query stays as a fallback so an over-narrow service term
     that returns nothing can't zero out the whole stock rung."""
     generic = brief.get("stock_query") or "modern small business"
@@ -724,7 +716,7 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
     _render_image_block).
 
     `service_desc` describes what this business actually does; an image that
-    depicts the WRONG service/setting (a sauna on an injectables clinic) is
+    depicts the WRONG service/setting (a gym on a dental practice) is
     marked use=false so `select_images` can fall through to a better source.
 
     Returns (reordered_urls, {url: {"desc","hero","use","focus"}}). Degrades to
@@ -741,9 +733,9 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
     match_line = (
         f"\n\nThis business is: {service_desc}. For EACH image also judge SERVICE MATCH — "
         "does it plausibly depict THIS kind of business/service? An image showing a "
-        "clearly WRONG service or setting (e.g. a sauna, massage table, or body-massage "
-        "room for an injectables/Botox clinic; a gym for a law office; a kitchen for a "
-        "dental office) is a MISMATCH — set 'match': false. When in doubt about a "
+        "clearly WRONG service or setting (e.g. a gym for a dental office; a kitchen for "
+        "a law office; a sauna or massage room for a dental practice) is a MISMATCH — set "
+        "'match': false. When in doubt about a "
         "generic, on-tone scene (a clean neutral interior, an elegant detail), allow it "
         "(match=true). A mismatch embarrasses the owner, so be strict about obviously "
         "wrong modalities." if service_desc else "")
@@ -790,17 +782,16 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
         '"focus": "top|center|bottom|left|right (where the main '
         'subject/face sits, so a crop keeps it in frame)"}, ...]}'})
     try:
-        client = _claude()
-        resp = client.messages.create(
+        resp = llm.create(
             # scale with the pool: each image needs ~130 tokens of JSON (desc +
             # hero + use + match + focus), so a fixed cap truncated 8-image stock
             # pools into unparseable JSON and the QC silently no-op'd.
-            model=config.MODEL_CLASSIFIER, max_tokens=min(2000, 300 + 140 * len(qc_urls)),
+            model=config.MODEL_VISION, max_tokens=min(2000, 300 + 140 * len(qc_urls)),
             system="You are a photo editor for premium web design. Be blunt about quality.",
             messages=[{"role": "user", "content": content}],
         )
         costs.record(conn, "claude", "photo_vision_rank",
-                     costs.claude_cost(config.MODEL_CLASSIFIER,
+                     costs.claude_cost(config.MODEL_VISION,
                                        resp.usage.input_tokens, resp.usage.output_tokens),
                      lead_id=lead["id"], tokens_in=resp.usage.input_tokens,
                      tokens_out=resp.usage.output_tokens)
@@ -938,6 +929,8 @@ def extract_brand(website: str) -> dict:
 
 SITE_FACTS_USD = 0.02          # cheap Haiku extraction; real cost ~0.005
 SITE_FACTS_CACHE = config.LOGS_DIR / "site_facts_cache.json"
+SITE_FACTS_SCHEMA = 2          # bump to invalidate cached entries when the shape changes
+                               # (2 = added their-own-words `descriptions`)
 
 
 def _url_key(url: str) -> str:
@@ -953,7 +946,10 @@ def _cached_site_facts(url: str):
         data = json.loads(SITE_FACTS_CACHE.read_text(encoding="utf-8"))
     except Exception:
         return None
-    return data.get(_url_key(url))
+    entry = data.get(_url_key(url))
+    if entry is None or entry.get("_schema") != SITE_FACTS_SCHEMA:
+        return None  # never extracted, or cached under an older shape — re-extract
+    return {k: v for k, v in entry.items() if k != "_schema"}
 
 
 def _remember_site_facts(url: str, facts: dict) -> None:
@@ -963,7 +959,7 @@ def _remember_site_facts(url: str, facts: dict) -> None:
             data = json.loads(SITE_FACTS_CACHE.read_text(encoding="utf-8"))
         except Exception:
             data = {}
-        data[_url_key(url)] = facts
+        data[_url_key(url)] = {**facts, "_schema": SITE_FACTS_SCHEMA}
         SITE_FACTS_CACHE.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         log.warning("could not persist site facts")
@@ -1008,7 +1004,7 @@ def extract_site_facts(conn, lead, website: str) -> dict:
     leak an unsourced claim into LOCKED CONTENT. Cached per-URL (calibration rebuilds
     are then free). Returns {} when there's no usable site or nothing extractable —
     never fails a build (this is an enhancement, not a gate)."""
-    if not website or not config.ANTHROPIC_API_KEY:
+    if not website or not config.LLM_API_KEY:
         return {}
     cached = _cached_site_facts(website)
     if cached is not None:
@@ -1024,20 +1020,25 @@ Do NOT infer, guess, or add anything typical-for-the-industry that isn't written
 
 Return STRICT JSON only:
 {{"services": ["<exact service / treatment names the site says they offer — short noun phrases, max 10>"],
-  "tagline": "<their own headline or tagline, copied verbatim, or empty if none clearly is one>"}}
+  "tagline": "<their own headline or tagline, copied verbatim, or empty if none clearly is one>",
+  "descriptions": ["<the business's own descriptive sentences about their practice, approach, or the patient experience — copied VERBATIM, word for word, up to 5>"]}}
 
 Rules:
-- services: concrete NAMED offerings (e.g. "Botox", "Dermal Filler", "Microneedling",
-  "Laser Hair Removal"), NOT vague categories ("wellness", "beauty", "self-care"). Copy the
+- services: concrete NAMED offerings (e.g. "Invisalign", "Teeth Whitening", "Dental Implants",
+  "Root Canal"), NOT vague categories ("wellness", "care", "healthy smiles"). Copy the
   site's own wording. Omit prices and durations.
 - Include a service ONLY if the text names it. If the site names none, return [].
+- descriptions: whole sentences copied EXACTLY as written (verbatim — never paraphrase,
+  shorten, or stitch fragments together). Choose lines that describe who they are, how they
+  treat patients, or the feel of a visit — their own VOICE. AVOID pure factual claims (years
+  in business, credentials, patient counts, awards) and anything with a superlative. If
+  nothing reads as genuine human voice, return [].
 - No superlatives, no invented specialties.
 
 WEBSITE TEXT:
 {text}"""
     try:
-        client = _claude()
-        resp = client.messages.create(
+        resp = llm.create(
             model=config.MODEL_CLASSIFIER, max_tokens=500,
             system="You extract only facts explicitly present in the given text. Never infer.",
             messages=[{"role": "user", "content": prompt}],
@@ -1070,30 +1071,47 @@ WEBSITE TEXT:
     tagline = re.sub(r"\s+", " ", str(data.get("tagline") or "")).strip()
     if not (8 <= len(tagline) <= 120 and _alnum(tagline) in site_norm):
         tagline = ""
+    # their own descriptive VOICE, verbatim-anchored like every other item — the raw
+    # material for copy that sounds like them instead of generated mood-filler. Anything
+    # the model paraphrased (so it no longer appears on their site) fails the anchor and
+    # is dropped, so only their real words survive.
+    descriptions, seen_d = [], set()
+    for d in (data.get("descriptions") or []):
+        d = re.sub(r"\s+", " ", str(d)).strip()
+        key = _alnum(d)
+        if 20 <= len(d) <= 240 and key and key in site_norm and key not in seen_d:
+            seen_d.add(key)
+            descriptions.append(d)
+        if len(descriptions) >= 5:
+            break
     facts = {}
     if services:
         facts["services"] = services
     if tagline:
         facts["tagline"] = tagline
+    if descriptions:
+        facts["descriptions"] = descriptions
     _remember_site_facts(website, facts)
     if facts:
-        log.info("lead %s site facts: %d service(s)%s", lead["id"], len(services),
-                 " + tagline" if tagline else "")
+        log.info("lead %s site facts: %d service(s)%s%s", lead["id"], len(services),
+                 " + tagline" if tagline else "",
+                 f" + {len(descriptions)} voice line(s)" if descriptions else "")
     return facts
 
 
 # --- Principles 4-5: prompt + multi-pass -----------------------------------
 
-def _claude():
-    import anthropic
-    return anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-
-
 def _call_claude(conn, system: str, user, lead_id: int,
-                 operation: str) -> str | None:
+                 operation: str, reasoning_effort: str | None = None) -> str | None:
     """`user` is a string, or (base_prompt, feedback_str) — the base prompt gets a
     cache breakpoint so gate/critique retries re-read it at ~10% of input price
-    (the retry always lands well inside the 5-min cache TTL)."""
+    (the retry always lands well inside the 5-min cache TTL).
+
+    `reasoning_effort` (Kimi/k3 only; ignored on Anthropic) MUST be set to "low" for
+    the big HTML generation: k3 at default effort reasons until it exhausts the whole
+    max_tokens budget and emits an EMPTY or truncated page (stop_reason=max_tokens),
+    which then fails the structural gate — every candidate, every lead. "low" trims the
+    reasoning so the full document fits (and runs ~3x faster). See config._REASONING_HEADROOM."""
     if costs.check(conn, "claude", EST_GEN_USD) == "block":
         log.warning("claude budget blocked; %s skipped", operation)
         return None
@@ -1105,13 +1123,13 @@ def _call_claude(conn, system: str, user, lead_id: int,
             content.append({"type": "text", "text": feedback})
     else:
         content = user
-    client = _claude()
-    resp = client.messages.create(
+    resp = llm.create(
         model=config.MODEL_QUALITY,
         max_tokens=GEN_MAX_TOKENS,
         system=[{"type": "text", "text": system,
                  "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": content}],
+        reasoning_effort=reasoning_effort,
     )
     usage = resp.usage
     costs.record(conn, "claude", operation,
@@ -1125,14 +1143,13 @@ def _call_claude(conn, system: str, user, lead_id: int,
     return resp.content[0].text
 
 
-# DESIGN-LANGUAGE MENU — distilled from reference med-spa sites Austin picked
-# (1-3: marasmedspa / medspafm / navamedicalspa; 4: milan / laseraway / rejuve).
-# Rotated one-per-lead so samples STOP converging on the same warm-blush-serif-centered
-# template (his "they all feel template" note). Each is a distinct, committed aesthetic.
-# Design DNA only — never their content/photos/brand. A real brand palette (from the
-# lead's own existing site) still OVERRIDES the language palette — see _render_design_language.
+# DESIGN-LANGUAGE MENU — four distinct, committed aesthetics, rotated one-per-lead so
+# samples STOP converging on the same generic centered template ("they all feel template").
+# Each is a deliberately different, committed look. Design DNA only — never their
+# content/photos/brand. A real brand palette (from the lead's own existing site) still
+# OVERRIDES the language palette — see _render_design_language.
 DESIGN_LANGUAGES = (
-    {   # 1. DARK LUXE (maras) — restrained, gold-on-charcoal, editorial
+    {   # 1. DARK LUXE — restrained, gold-on-charcoal, editorial
         "name": "Dark Luxe",
         "palette": "a deep charcoal / near-black base (#16181c–#1f2328) with warm "
                    "cream sections and ONE confident gold accent (#c8a96a); solid "
@@ -1145,7 +1162,7 @@ DESIGN_LANGUAGES = (
                   "an even service grid with a subtle gold hairline/badge per card; "
                   "one confident full-bleed dark band. Generous 80–120px section padding",
         "motion": "scroll-reveal (fade + translateY) and gold-underline/lift on hover"},
-    {   # 2. WARM EDITORIAL (medspafm) — mocha/rose, asymmetric splits
+    {   # 2. WARM EDITORIAL — warm neutrals, asymmetric splits
         "name": "Warm Editorial",
         "palette": "warm mocha/clay (#8f6e56) + soft rose-clay (#d1a394) + warm cream "
                    "whites; a brown/clay accent used decisively in one full-bleed band",
@@ -1158,7 +1175,7 @@ DESIGN_LANGUAGES = (
                   "by hairline dividers with arrow affordances (not always boxed cards); "
                   "a warm full-bleed accent band near the end. No two adjacent sections share a layout",
         "motion": "IntersectionObserver scroll-reveal + card/button hover-lift (pop)"},
-    {   # 3. AIRY MINIMAL (nava) — white, one bold accent, big whitespace
+    {   # 3. AIRY MINIMAL — white, one bold accent, big whitespace
         "name": "Airy Minimal",
         "palette": "mostly white / off-white with near-black text and ONE bold saturated "
                    "accent (a deep plum-violet #6d4aa3 OR a deep emerald — pick what fits "
@@ -1169,13 +1186,13 @@ DESIGN_LANGUAGES = (
                   "image blocks that bleed off one edge; a single bold accent divider band; "
                   "very few boxed cards; oversized type carrying the hierarchy instead of borders",
         "motion": "subtle scroll-reveal fades; minimal, calm hover states"},
-    {   # 4. CLINICAL MODERN (milan / laseraway / rejuve) — confident teal, big scale,
-        # bold stat band. The premium modern-clinic look, NOT a soft blush spa.
+    {   # 4. CLINICAL MODERN — confident teal, big scale,
+        # bold stat band. The premium modern-clinic look.
         "name": "Clinical Modern",
         "palette": "confident and clean: a deep TEAL accent (#00698a / #0d7d8f) with warm "
                    "CREAM (#f3efe7) section backgrounds, crisp white, and deep navy/charcoal "
-                   "text; rounded PILL buttons in the teal accent — reads like a modern "
-                   "clinic, never a soft pastel spa",
+                   "text; rounded PILL buttons in the teal accent — reads like a modern, "
+                   "premium clinic",
         "type": "DRAMATIC scale contrast: a huge headline pairing an elegant ITALIC SERIF "
                 "display accent word (Playfair/Cormorant-style) with a heavy geometric SANS "
                 "(Jost/Poppins-style), above a tiny UPPERCASE letter-spaced kicker; clean "
@@ -1196,7 +1213,7 @@ def _render_design_language(dl: dict, has_brand: bool) -> str:
                 "language's TYPE energy, LAYOUT and MOTION."
                 if has_brand else
                 "Commit FULLY to this language — do NOT drift back to a generic "
-                "warm-blush/sage centered spa template.")
+                "centered brochure template.")
     return (f"COMMITTED DESIGN LANGUAGE for this build — \"{dl['name']}\" (every build "
             f"gets a deliberately different one so no two samples look alike):\n"
             f"  Palette: {dl['palette']}\n"
@@ -1322,6 +1339,7 @@ def assemble_content_blocks(lead, profile: dict, site_facts: dict | None = None,
         "attribution": "— Google review",
         "real_services": site_facts.get("services") or [],
         "tagline": site_facts.get("tagline") or None,
+        "their_copy": site_facts.get("descriptions") or [],
     }
 
 
@@ -1348,6 +1366,15 @@ def _render_content_contract(content: dict) -> str:
         lines.append(
             f'  THEIR TAGLINE (their own words, from their site) — you MAY use or lightly '
             f'adapt it as headline/voice; it is not a checkable fact: "{content["tagline"]}"')
+    if content.get("their_copy"):
+        lines.append(
+            '  THEIR OWN WORDS (voice source — NOT a locked item; do NOT paste these verbatim): '
+            "real sentences from the business's OWN website. PREFER adapting THESE phrasings for "
+            'the welcome/about and the service blurbs instead of inventing marketing copy — their '
+            'wording sounds more human than generated filler. You MAY lightly edit for flow, '
+            'length, and fit, but keep their meaning and voice, and state NO fact beyond these '
+            'lines and the locked items above:')
+        lines += [f'    - "{c}"' for c in content["their_copy"]]
     if content["rating_line"]:
         lines.append(
             f'  RATING LINE (show ONCE, in/near testimonials — never as a hero badge): '
@@ -1551,8 +1578,9 @@ spots destroys all trust in the pitch, so treat this as harder than any design r
     say. Read each line aloud — if it sounds stiff, translated, ESL-ish, or like filler,
     rewrite it. Relaxed and warm, never salesy or breathless.
   * GOOD AT DESCRIPTION: be concrete and lightly sensory about the ACTUAL experience
-    (the calm room, the unhurried visit, the natural-looking result) — plain vivid
-    English, not vague abstract benefit-speak.
+    (the calm room, the easy check-in, the natural-looking result) — plain vivid
+    English, not vague abstract benefit-speak. Don't lean on any single mood-word
+    (e.g. "unhurried") by repeating it across the hero, a heading, and the closing line.
   * BANNED empty/abstract filler: "the kind of attention that feels personal", "a
     considered approach", "subtle results and ...", "elevate your journey", "your journey
     to ...", and similar hollow lines. Plain beats poetic every time.
@@ -1706,7 +1734,7 @@ def fact_check(conn, lead, profile: dict, html: str,
     folded into VERIFIED DATA so the checker treats those named services as supported
     — otherwise it would flag the very specificity we just added as "unsupported".
     """
-    if not config.ANTHROPIC_API_KEY:
+    if not config.LLM_API_KEY:
         return True, ""
     if costs.check(conn, "claude", FACT_CHECK_USD) == "block":
         return True, ""  # budget-blocked: don't fail the sample over the fact-check
@@ -1720,6 +1748,7 @@ def fact_check(conn, lead, profile: dict, html: str,
         "open_days_per_week": sum(1 for h in hours if "closed" not in h.lower()),
         "summary": profile.get("summary"),
         "services_listed_on_their_own_website": site_facts.get("services") or None,
+        "copy_from_their_own_website": site_facts.get("descriptions") or None,
         "reviews_with_ratings": profile.get("reviews"),
     }
     trimmed = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html,
@@ -1759,8 +1788,7 @@ PAGE HTML:
 Return STRICT JSON only:
 {{"ok": true|false, "unsupported": [{{"claim": "<what>", "page_quote": "<exact words copied from the PAGE HTML>", "why": "<why unsupported>"}}]}}"""
     try:
-        client = _claude()
-        resp = client.messages.create(
+        resp = llm.create(
             model=config.MODEL_CLASSIFIER, max_tokens=800,
             system="You are a strict, conservative fact-checker.",
             messages=[{"role": "user", "content": prompt}],
@@ -1811,27 +1839,27 @@ Return STRICT JSON only:
 
 def _core_brand(name: str) -> str:
     """Brand portion of a listing name, dropping a parenthetical location and any
-    provider/credential suffix ("Syringe Aesthetics - Manuel Guillen, FNP" ->
-    "Syringe Aesthetics"; "I Love My Look Aesthetics (Viridian, Arlington Location)"
-    -> "I Love My Look Aesthetics"). The generator correctly brands to this, so the
+    provider/credential suffix ("Park Cities Family Dentistry - John Smith, DDS" ->
+    "Park Cities Family Dentistry"; "Whitley Family Dental (Uptown Location)"
+    -> "Whitley Family Dental"). The generator correctly brands to this, so the
     gate must too."""
     name = re.sub(r"\s*\([^)]*\)", "", name).strip()  # drop "(Viridian, ...)"
     return re.split(r"\s+[-–—|]\s+|,\s*", name, maxsplit=1)[0].strip()
 
 
 _GENERIC_BRAND_WORDS = {
-    "med", "medspa", "spa", "spas", "aesthetic", "aesthetics", "salon", "clinic",
-    "wellness", "school", "llc", "inc", "co", "the", "and", "of", "skin", "beauty",
-    "studio", "center", "centre", "institute", "bar", "lounge", "medical", "cosmetic",
-    "cosmetics", "laser", "day", "group", "care", "health",
+    "dental", "dentistry", "dentist", "dentists", "family", "cosmetic", "pediatric",
+    "orthodontics", "orthodontic", "ortho", "smile", "smiles", "dds", "dmd", "clinic",
+    "wellness", "school", "llc", "inc", "co", "pa", "pllc", "the", "and", "of",
+    "studio", "center", "centre", "institute", "medical", "day", "group", "care", "health",
 }
 
 
 def _brand_present(name: str, page_lower: str) -> bool:
     """True if the page carries the business's brand. Matches on the DISTINCTIVE lead
-    words (ignoring generic 'med spa / aesthetics / ...' descriptors), with &<->and
-    normalized, so a page that brands itself "Fit & Fancy" satisfies the listing
-    "Fit & Fancy Med Spa & School" instead of triggering a false 'name missing' retry."""
+    words (ignoring generic 'family dentistry / dental care / ...' descriptors), with
+    &<->and normalized, so a page that brands itself "Park Cities" satisfies the listing
+    "Park Cities Family Dentistry" instead of triggering a false 'name missing' retry."""
     def toks(s: str) -> list[str]:
         return [t for t in re.split(r"[^a-z0-9]+", s.lower().replace("&", " and ")) if t]
     page = set(toks(page_lower))
@@ -1839,12 +1867,12 @@ def _brand_present(name: str, page_lower: str) -> bool:
                    if t not in _GENERIC_BRAND_WORDS and len(t) > 1]
     if distinctive:
         return all(t in page for t in distinctive[:2])  # first two lead words suffice
-    # entirely-generic brand (e.g. "MedSpa") — fall back to the joined core string
+    # entirely-generic brand (e.g. "Dental Care") — fall back to the joined core string
     return "".join(toks(_core_brand(name))) in re.sub(r"[^a-z0-9]", "", page_lower)
 
 
 def structural_gate(html: str, lead, images: list[str],
-                    source_text: str = "") -> str | None:
+                    source_text: str = "", logo: str | None = None) -> str | None:
     """Doc 01 STEP 3 hard-defect gate. Returns None if OK, else the failure."""
     lower = html.lower()
     if not _brand_present(lead["business_name"], lower):
@@ -1875,6 +1903,15 @@ def structural_gate(html: str, lead, images: list[str],
             return f"invented image URL: {src[:80]}"
     if images and not srcs:
         return "good real photo available but page fell back to no images"
+    # NEVER reuse a PHOTO within one page (Austin's rule; the prompt lesson alone doesn't
+    # stop the model). The logo legitimately repeats (header + footer), so exclude it.
+    def _pnorm(u: str) -> str:
+        return re.sub(r"[?#].*$", "", u)
+    logo_n = _pnorm(logo) if logo else None
+    photos = [_pnorm(s) for s in srcs if not s.startswith("data:")]
+    photos = [p for p in photos if p != logo_n]
+    if len(photos) != len(set(photos)):
+        return "same photo reused on the page (each photo must appear at most once)"
     # NOTE: unsourced superlatives are no longer a hard gate failure — they are scrubbed
     # deterministically in build_one (_scrub_superlatives) BEFORE this gate, so they can
     # never kill a lead (leads 214/234 died here on "best"/"#1"). Invented amenities /
@@ -1964,9 +2001,24 @@ def _localize_images(html: str, out_dir) -> tuple[str, list[str]]:
 
 
 def _ship_sample(conn, lead, html: str, image_source: str,
-                 fact_flag_note: str | None = None) -> bool:
+                 fact_flag_note: str | None = None, preview_dir=None) -> bool:
     """Persist a finished sample and transition the lead to SAMPLE_BUILT — the
-    shared tail for both the single-shot and best-of-N build paths."""
+    shared tail for both the single-shot and best-of-N build paths.
+
+    When `preview_dir` is set, write a self-contained render THERE and touch nothing
+    else — no samples_cache slug, no DB transition, no stock-dedup bookkeeping, no
+    URL verify. This previews a REBUILD of an already-shipped lead (e.g. to see new
+    LESSONS.md copy rules or their-own-words wording applied) without clobbering the
+    live sample. Returns True on success."""
+    if preview_dir is not None:
+        from pathlib import Path
+        out_dir = Path(preview_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        html, localized = _localize_images(html, out_dir)
+        (out_dir / "index.html").write_text(html, encoding="utf-8")
+        log.info("lead %s: PREVIEW -> %s (%d self-hosted image(s); DB untouched)",
+                 lead["id"], out_dir / "index.html", len(localized))
+        return True
     slug = unique_slug(conn, lead)
     out_dir = config.SAMPLES_CACHE_DIR / slug
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2047,9 +2099,11 @@ def _render_two(browser, uri: str) -> dict:
     return shots
 
 
-def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> str:
+def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> tuple[str, str]:
     """Ask the vision judge which of two rendered candidates is better. Returns
-    'a' or 'b' (defaults to 'a' on any parse/API failure — a stable, harmless tie-break)."""
+    (winner, reason) with winner 'a' or 'b' (defaults to ('a', ...) on any parse/API
+    failure — a stable, harmless tie-break). The reason is a free annotation Step-0
+    captures verbatim."""
     biz = f"{lead['business_name']} ({lead['category'] or 'local business'})"
 
     def _imgs(shots):
@@ -2063,8 +2117,7 @@ def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> str:
                {"type": "text", "text": "=== SAMPLE B — fold ==="}, *_imgs({"fold": shots_b.get("fold")}),
                {"type": "text", "text": "=== SAMPLE B — full page ==="}, *_imgs({"full": shots_b.get("full")})]
     try:
-        client = _claude()
-        resp = client.messages.create(
+        resp = llm.create(
             model=config.MODEL_QUALITY, max_tokens=200,
             system="You are a decisive, brutally honest design director grading sample "
                    "websites for a cold-outreach pipeline. Judge like a picky business owner.",
@@ -2077,18 +2130,20 @@ def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> str:
         conn.commit()
         data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
         winner = "b" if str(data.get("winner", "A")).strip().upper().startswith("B") else "a"
-        log.info("lead %s judge: %s (%s)", lead["id"], winner.upper(),
-                 str(data.get("reason", ""))[:120])
-        return winner
+        reason = str(data.get("reason", ""))[:200]
+        log.info("lead %s judge: %s (%s)", lead["id"], winner.upper(), reason[:120])
+        return winner, reason
     except Exception:
         log.exception("lead %s pairwise judge failed; defaulting to A", lead["id"])
-        return "a"
+        return "a", "judge failed — defaulted to A"
 
 
-def _tournament(conn, lead, htmls: list[str]) -> int:
-    """Render every candidate and run a round-robin pairwise tournament; return the
-    index of the candidate with the most wins (ties -> lowest index). Raises on a
-    Playwright/render failure so the caller can fall back."""
+def _tournament(conn, lead, htmls: list[str]) -> tuple[int, dict, list]:
+    """Render every candidate and run a round-robin pairwise tournament; return
+    (best_idx, shots, pairwise): the winner (most wins, ties -> lowest index), the
+    rendered JPEG bytes keyed by candidate index (so Step-0 reuses them instead of
+    re-rendering), and the per-pair judge annotations. Raises on a Playwright/render
+    failure so the caller can fall back."""
     from playwright.sync_api import sync_playwright  # laptop-only
     tmp = config.LOGS_DIR / "bon"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -2103,19 +2158,23 @@ def _tournament(conn, lead, htmls: list[str]) -> int:
         finally:
             browser.close()
     wins = {i: 0 for i in range(len(htmls))}
+    pairwise: list[dict] = []
     for a, b in itertools.combinations(range(len(htmls)), 2):
         if costs.check(conn, "claude", BON_JUDGE_USD) == "block":
             log.warning("lead %s: budget blocked mid-tournament", lead["id"])
             break
-        winner = _pairwise_pick(conn, lead, shots[a], shots[b])
-        wins[a if winner == "a" else b] += 1
+        winner, reason = _pairwise_pick(conn, lead, shots[a], shots[b])
+        win_idx = a if winner == "a" else b
+        wins[win_idx] += 1
+        pairwise.append({"a": a, "b": b, "winner": win_idx, "reason": reason})
     log.info("lead %s tournament wins: %s", lead["id"], wins)
-    return max(range(len(htmls)), key=lambda i: (wins[i], -i))
+    best = max(range(len(htmls)), key=lambda i: (wins[i], -i))
+    return best, shots, pairwise
 
 
 def _try_best_of_n(conn, lead, *, brief, brand, site_facts, services, profile,
                    source_text, content, images, image_source, image_notes,
-                   allowed_images, system, feedback_seed) -> bool | None:
+                   allowed_images, system, feedback_seed, preview_dir=None) -> bool | None:
     """Generate BEST_OF_N diverse candidates and ship the tournament winner.
 
     Returns True/False when it produces a definitive build outcome, or None to tell
@@ -2129,28 +2188,38 @@ def _try_best_of_n(conn, lead, *, brief, brand, site_facts, services, profile,
     n = min(BEST_OF_N, len(DESIGN_LANGUAGES))
     seed = "\n\n".join(feedback_seed)
     candidates: list[tuple[str, dict, str]] = []   # (html, design_language, archetype)
+    cap_cands: list[dict] = []   # STEP-0: EVERY generated candidate (pass AND fail) to capture
     for i in range(n):
         dl = DESIGN_LANGUAGES[(start + i) % len(DESIGN_LANGUAGES)]
         arch = ARCHETYPES[(lead["id"] + i) % len(ARCHETYPES)]
         base_prompt = build_prompt(lead, brief, arch, images, content, brand,
                                    image_source, image_notes, dl)
         raw = _call_claude(conn, system, (base_prompt, seed),
-                           lead["id"], f"sample_generate_bon{i + 1}")
+                           lead["id"], f"sample_generate_bon{i + 1}",
+                           reasoning_effort="low")
         if raw is None:
             break  # budget blocked — stop drawing candidates
         cand = _scrub_superlatives(extract_html(raw), source_text)
-        if structural_gate(cand, lead, allowed_images, source_text) is None:
+        gate = structural_gate(cand, lead, allowed_images, source_text,
+                               logo=brand.get("logo"))
+        cap_cands.append({"html": cand, "dl": dl, "arch": arch,
+                          "gate_pass": gate is None, "gate_reason": gate,
+                          "image_source": image_source})
+        if gate is None:
             candidates.append((cand, dl, arch))
             log.info("lead %s bon cand %d (%s): gate PASS", lead["id"], i + 1, dl["name"])
         else:
-            log.info("lead %s bon cand %d (%s): gate FAIL", lead["id"], i + 1, dl["name"])
+            log.info("lead %s bon cand %d (%s): gate FAIL — %s",
+                     lead["id"], i + 1, dl["name"], gate)
     if not candidates:
         return None  # nothing to select — single-shot has retry-with-feedback
+    shots: dict = {}
+    pairwise: list = []
     if len(candidates) == 1:
         best = 0
     else:
         try:
-            best = _tournament(conn, lead, [c[0] for c in candidates])
+            best, shots, pairwise = _tournament(conn, lead, [c[0] for c in candidates])
         except Exception:
             log.exception("lead %s: tournament render/judge failed; using first passer",
                           lead["id"])
@@ -2159,12 +2228,24 @@ def _try_best_of_n(conn, lead, *, brief, brand, site_facts, services, profile,
     log.info("lead %s: best-of-%d winner = cand %d (%s)", lead["id"],
              len(candidates), best + 1, win_dl["name"])
 
+    # STEP-0 capture: ship first (unchanged), then persist the whole build durably.
+    # `best` is the tournament winner's index among gate-passers (== its cand_<i> / logs/bon
+    # index); a downstream fact-fix ships a refined winner but shipped_idx stays `best`
+    # (which candidate was selected). Capture is non-fatal and SKIPPED in preview_dir mode.
+    def _ship_and_capture(html_to_ship, note):
+        ok = _ship_sample(conn, lead, html_to_ship, image_source, note, preview_dir)
+        if ok:
+            dataset.capture_build(conn, lead, cap_cands, shots, pairwise,
+                                  auto_pick_idx=best, shipped_idx=best,
+                                  preview=preview_dir is not None)
+        return ok
+
     # honesty pass on the WINNER only (the tournament already selected for design/hero).
     # Facts are code-assembled, so a flag here is a rare prose slip — try one targeted
     # fix, then degrade-not-die (ship flagged for factor-F grading) rather than kill it.
     fact_ok, fact_fixes = fact_check(conn, lead, profile, winner_html, site_facts)
     if fact_ok or not fact_fixes:
-        return _ship_sample(conn, lead, winner_html, image_source, None)
+        return _ship_and_capture(winner_html, None)
     log.info("lead %s: winner fact-flagged, one fix pass: %s", lead["id"], fact_fixes[:160])
     fix_fb = list(feedback_seed) + [
         "FACT-CHECK — your marketing copy stated these claims, which are NOT in LOCKED "
@@ -2175,23 +2256,26 @@ def _try_best_of_n(conn, lead, *, brief, brand, site_facts, services, profile,
     fix_prompt = build_prompt(lead, brief, win_arch, images, content, brand,
                               image_source, image_notes, win_dl)
     raw = _call_claude(conn, system, (fix_prompt, "\n\n".join(fix_fb)),
-                       lead["id"], "sample_generate_bon_fix")
+                       lead["id"], "sample_generate_bon_fix", reasoning_effort="low")
     if raw is not None:
         fixed = _scrub_superlatives(extract_html(raw), source_text)
-        if structural_gate(fixed, lead, allowed_images, source_text) is None:
+        if structural_gate(fixed, lead, allowed_images, source_text,
+                           logo=brand.get("logo")) is None:
             ok2, fixes2 = fact_check(conn, lead, profile, fixed, site_facts)
             note = None if ok2 else "fact_flagged: " + fixes2[:180]
-            return _ship_sample(conn, lead, fixed, image_source, note)
+            return _ship_and_capture(fixed, note)
     # fix regressed or was blocked — ship the winner flagged (SHIP_WHEN_FACT_FLAGGED)
     if SHIP_WHEN_FACT_FLAGGED:
-        return _ship_sample(conn, lead, winner_html, image_source,
-                            "fact_flagged: " + fact_fixes[:180])
-    db.transition(conn, lead["id"], "SAMPLE_FAILED", "fact-check unresolved: " + fact_fixes[:140])
-    conn.commit()
+        return _ship_and_capture(winner_html, "fact_flagged: " + fact_fixes[:180])
+    if preview_dir is None:
+        db.transition(conn, lead["id"], "SAMPLE_FAILED", "fact-check unresolved: " + fact_fixes[:140])
+        conn.commit()
     return False
 
 
-def build_one(conn, lead) -> bool:
+def build_one(conn, lead, preview_dir=None) -> bool:
+    # preview_dir set => render a rebuild to that folder without touching the DB /
+    # samples_cache (preview an already-shipped lead; see _ship_sample).
     profile = json.loads(lead["source_profile"] or "{}")
     brief = niche_brief(lead["category"], lead["business_name"])
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
@@ -2202,12 +2286,12 @@ def build_one(conn, lead) -> bool:
     # their REAL services + tagline from their own site — the substance that lets the
     # copy be specific instead of generic mood-filler (strictly sourced; cached per-URL).
     # Extracted BEFORE image selection so the real services drive the stock query and
-    # the vision service-match check (a sauna won't slip onto an injectables clinic).
+    # the vision service-match check (a gym won't slip onto a dental practice).
     site_facts = (extract_site_facts(conn, lead, lead["existing_website"])
                   if lead["existing_website"] else {})
     services = site_facts.get("services") or []
     # a plain "what this business does" line for the vision QC's service-match verdict;
-    # the name often encodes the modality ("Miss Botox") when there are no listed services
+    # the name often encodes the specialty ("Smile Studio") when there are no listed services
     service_desc = lead["business_name"] or lead["category"] or "local business"
     desc_extra = [b for b in (lead["category"],
                               ("offering " + ", ".join(services[:8])) if services else "")
@@ -2243,6 +2327,7 @@ def build_one(conn, lead) -> bool:
         profile.get("summary") or "",
         *(site_facts.get("services") or []),
         site_facts.get("tagline") or "",
+        *(site_facts.get("descriptions") or []),
         *[r.get("text", "") for r in (profile.get("reviews") or [])],
     ])
 
@@ -2285,7 +2370,7 @@ def build_one(conn, lead) -> bool:
             services=services, profile=profile, source_text=source_text,
             content=content, images=images, image_source=image_source,
             image_notes=image_notes, allowed_images=allowed_images,
-            system=system, feedback_seed=feedback)
+            system=system, feedback_seed=feedback, preview_dir=preview_dir)
         if outcome is not None:
             return outcome
         log.info("lead %s: best-of-N unavailable — single-shot fallback", lead["id"])
@@ -2296,7 +2381,7 @@ def build_one(conn, lead) -> bool:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         final_attempt = attempt == MAX_ATTEMPTS
         raw = _call_claude(conn, system, (base_prompt, "\n\n".join(feedback)),
-                           lead["id"], f"sample_generate_a{attempt}")
+                           lead["id"], f"sample_generate_a{attempt}", reasoning_effort="low")
         if raw is None:
             failure = "claude budget blocked"
             break
@@ -2305,7 +2390,8 @@ def build_one(conn, lead) -> bool:
         # model keeps writing "best"/"#1" no matter the prompt ban, and failing the gate
         # on them just burns a retry (or kills the lead). Scrubbing keeps the page honest.
         candidate = _scrub_superlatives(candidate, source_text)
-        failure = structural_gate(candidate, lead, allowed_images, source_text)
+        failure = structural_gate(candidate, lead, allowed_images, source_text,
+                                  logo=brand.get("logo"))
         if failure:
             log.info("lead %s attempt %s failed gate: %s", lead["id"], attempt, failure)
             feedback.append(
@@ -2361,11 +2447,22 @@ def build_one(conn, lead) -> bool:
                     lead["id"], last_flags[:200])
 
     if html is None:
-        db.transition(conn, lead["id"], "SAMPLE_FAILED", failure or "unknown")
-        conn.commit()
+        if preview_dir is None:
+            db.transition(conn, lead["id"], "SAMPLE_FAILED", failure or "unknown")
+            conn.commit()
+        else:
+            log.warning("lead %s: PREVIEW generation failed (%s); DB untouched",
+                        lead["id"], failure or "unknown")
         return False
 
-    return _ship_sample(conn, lead, html, image_source, fact_flag_note)
+    ok = _ship_sample(conn, lead, html, image_source, fact_flag_note, preview_dir)
+    # STEP-0: log the single-shot fallback as a degenerate 1-candidate build record
+    # (no tournament — the sole candidate is trivially the auto/shipped pick). Preview
+    # builds touch no DB/samples, so they write no dataset record either.
+    if ok and preview_dir is None:
+        dataset.capture_single_shot(conn, lead, html, design_language, archetype,
+                                    image_source, fact_flagged=fact_flag_note is not None)
+    return ok
 
 
 def build_samples(limit: int = 10) -> dict:

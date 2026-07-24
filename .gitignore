@@ -6,6 +6,7 @@ token.json
 credentials.json
 samples_cache/
 logs/
+dataset/
 __pycache__/
 *.pyc
 .venv/

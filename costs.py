@@ -7,11 +7,20 @@ import db
 
 log = logging.getLogger(__name__)
 
-# per-1M-token prices (confirm against live Anthropic pricing before launch)
+# per-1M-token (input, output) prices. Confirm against each provider's live pricing
+# before launch — these change. Keyed by model id; the ledger stores the id, so a
+# provider switch just adds rows here (claude_cost falls back to the Opus rate if a
+# model id is missing, so an unknown model over-estimates rather than under-bills).
 CLAUDE_PRICES = {
+    # Anthropic (flip-back / legacy rows)
     "claude-opus-4-8": (5.00, 25.00),
     "claude-haiku-4-5-20251001": (1.00, 5.00),
     "claude-sonnet-4-6": (3.00, 15.00),
+    # Moonshot / Kimi (active provider)
+    "kimi-k3": (3.00, 15.00),
+    "kimi-k2.7-code": (0.95, 4.00),
+    "kimi-k2.6": (0.95, 4.00),
+    "kimi-k2.5": (0.60, 3.00),
 }
 PLACES_TEXT_SEARCH_USD = 0.032   # per text search request
 PLACES_DETAILS_USD = 0.025       # per details request (basic + contact + atmosphere)

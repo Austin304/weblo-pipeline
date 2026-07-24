@@ -5,23 +5,29 @@ tailored sample site, cold-emails the sample, and notifies the operator on
 Telegram when someone is interested. Specs live in the parent folder (docs
 00-09); this folder is the implementation.
 
+> **Active niche: DENTISTS only** — see [NICHE.md](NICHE.md). Do not build med-spa /
+> cosmetic leads; the pivot off med spas is complete.
+
 ## Layout
 
 | File | Job |
 |---|---|
 | `config.py` | loads `.env` (from here or the parent folder) |
+| `llm.py` | provider-neutral LLM wrapper — all model calls route here; `LLM_PROVIDER` selects Kimi (default) or Claude |
 | `db.py` | SQLite state layer, WAL mode (doc 04) |
 | `costs.py` | spend ledger + budget gate — every paid call checks first (doc 08) |
 | `find_leads.py` | stage 1: Places search → qualify → email discovery (find-leads-brief) |
-| `build_sample.py` | stage 2: niche briefs + archetypes + multi-pass Claude generation (doc 01) |
+| `build_sample.py` | stage 2: niche briefs + archetypes + best-of-N LLM generation via `llm.py` (doc 01) |
 | `serve_samples.py` | long-running: serves samples + logs visits (fronted by Cloudflare Tunnel) |
-| `write_email.py` | Claude cold-email + follow-up copy (email-writing-instructions) |
+| `write_email.py` | LLM cold-email + follow-up copy (email-writing-instructions) |
 | `send_email.py` | Gmail send with cap/pacing/window/suppression (email-agent-instructions) |
 | `watch_replies.py` | long-running: reply classification, Telegram alerts + commands (doc 02) |
 | `run.py` | cron entrypoint: `find` / `build` / `send` / `followups` / `status` |
 
 Deferred (by design, month-one scope cut): postcards (doc 06), automated full
-build (doc 03), metrics module (doc 09) beyond the built-in bounce guard.
+build (doc 03), metrics module (doc 09) beyond the built-in bounce guard. The
+`.env` template still carries the Lob / mail-from keys so the postcard track can
+be switched on later; `LOB_MODE=test` keeps it inert until then.
 
 ## First-time setup
 

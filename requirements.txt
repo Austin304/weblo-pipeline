@@ -1,4 +1,5 @@
-anthropic>=0.40.0
+openai>=1.40.0          # active LLM provider: Kimi via Moonshot's OpenAI-compatible API (llm.py)
+anthropic>=0.40.0       # flip-back provider (LLM_PROVIDER=anthropic) for A/B-ing sample quality
 google-api-python-client>=2.140.0
 google-auth>=2.34.0
 google-auth-oauthlib>=1.2.0

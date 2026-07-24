@@ -56,6 +56,14 @@ def get_float(key: str, default: float) -> float:
 
 # --- core ---
 ANTHROPIC_API_KEY = get("ANTHROPIC_API_KEY")
+# LLM provider: "moonshot" (Kimi, default) or "anthropic" (Claude, the flip-back for
+# A/B-ing sample quality). Moonshot is OpenAI-compatible, so llm.py drives both.
+LLM_PROVIDER = (get("LLM_PROVIDER", "moonshot") or "moonshot").lower()
+MOONSHOT_API_KEY = get("MOONSHOT_API_KEY")
+MOONSHOT_BASE_URL = get("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
+# the active provider's key — call-site guards check THIS, not a hard-coded vendor,
+# so switching providers doesn't silently disable site-facts / fact-check.
+LLM_API_KEY = MOONSHOT_API_KEY if LLM_PROVIDER == "moonshot" else ANTHROPIC_API_KEY
 GOOGLE_PLACES_API_KEY = get("GOOGLE_PLACES_API_KEY")
 ZEROBOUNCE_API_KEY = get("ZEROBOUNCE_API_KEY")  # optional; MX fallback if blank
 # optional free stock-photo APIs (image ladder step 3; all free tiers)
@@ -69,6 +77,10 @@ SAMPLES_PORT = get_int("SAMPLES_PORT", 8788)
 SAMPLE_BASE_URL = (get("SAMPLE_BASE_URL") or "").rstrip("/")
 SAMPLES_CACHE_DIR = _HERE / "samples_cache"
 LOGS_DIR = _HERE / "logs"
+# Step-0 durable training-data capture (see dataset.py): one permanent per-build dir
+# + append-only builds.jsonl. Replaces reliance on the ephemeral logs/bon (overwritten
+# by any later build of the same lead — the 278 data-loss in STEP0-HANDOFF §0).
+DATASET_DIR = _HERE / "dataset"
 # distilled style cribs from top-graded samples + curated grading lessons;
 # injected into the generator's system prompt (see build_sample._style_context)
 EXEMPLARS_DIR = _HERE / "exemplars"
@@ -87,6 +99,8 @@ BUSINESS_MAILING_ADDRESS = get("BUSINESS_MAILING_ADDRESS", "")
 FOLLOWUP_AFTER_DAYS = get_int("FOLLOWUP_AFTER_DAYS", 6)
 
 # --- standing campaign ---
+# ACTIVE NICHE IS DENTISTS ONLY (see NICHE.md). CAMPAIGN_NICHE should be "dentist".
+# The med-spa niche was retired 2026-07-22 — do not target med-spa/cosmetic businesses.
 CAMPAIGN_LOCATION = get("CAMPAIGN_LOCATION")
 CAMPAIGN_NICHE = get("CAMPAIGN_NICHE")
 CAMPAIGN_TARGET_COUNT = get_int("CAMPAIGN_TARGET_COUNT", 50)
@@ -97,9 +111,21 @@ CAMPAIGN_TARGET_COUNT = get_int("CAMPAIGN_TARGET_COUNT", 50)
 CAMPAIGN_AREAS = [a.strip() for a in (get("CAMPAIGN_AREAS", "") or "").split(";")
                   if a.strip()]
 
-# --- models (doc 00: decided, do not re-litigate) ---
-MODEL_QUALITY = "claude-opus-4-8"          # sample HTML + email copy
-MODEL_CLASSIFIER = "claude-haiku-4-5-20251001"  # reply classification
+# --- models ---
+# Three tiers, swapped as a set by LLM_PROVIDER so an A/B flip stays one env var:
+#   QUALITY    — sample HTML generation + pairwise vision judging (design taste)
+#   VISION     — photo ranking (needs image input; kept off the cheap tier because
+#                value-tier vision support isn't guaranteed)
+#   CLASSIFIER — pure-text grunt work: qualify, reply-classify, fact-check, site-facts
+# Overridable individually via env (MODEL_QUALITY / MODEL_VISION / MODEL_CLASSIFIER).
+if LLM_PROVIDER == "anthropic":
+    MODEL_QUALITY = get("MODEL_QUALITY", "claude-opus-4-8")
+    MODEL_VISION = get("MODEL_VISION", "claude-haiku-4-5-20251001")
+    MODEL_CLASSIFIER = get("MODEL_CLASSIFIER", "claude-haiku-4-5-20251001")
+else:  # moonshot (Kimi)
+    MODEL_QUALITY = get("MODEL_QUALITY", "kimi-k3")        # design the samples (Austin's call)
+    MODEL_VISION = get("MODEL_VISION", "kimi-k3")          # native vision, picks the winner
+    MODEL_CLASSIFIER = get("MODEL_CLASSIFIER", "kimi-k2.6")  # cheap text jobs
 
 # --- sample generation: best-of-N (turn generation variance into a selection asset) ---
 # For each lead, generate this many diverse candidate samples (one per design

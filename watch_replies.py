@@ -15,6 +15,7 @@ import config
 import costs
 import db
 import find_leads
+import llm
 import notify
 import send_email
 
@@ -49,9 +50,7 @@ def classify_reply(conn, lead, text: str) -> dict:
     if costs.check(conn, "claude", EST_CLASSIFY_USD) == "block":
         return {"class": "QUESTION", "summary": text[:200],
                 "suggested_reply_hint": ""}  # fail toward notifying a human
-    import anthropic
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    resp = client.messages.create(
+    resp = llm.create(
         model=config.MODEL_CLASSIFIER, max_tokens=300,
         system="You classify replies to a cold email that pitched a free sample website.",
         messages=[{"role": "user", "content": f"""Classify this reply into exactly one of:

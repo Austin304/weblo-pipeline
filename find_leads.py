@@ -15,6 +15,7 @@ from bs4 import BeautifulSoup
 import config
 import costs
 import db
+import llm
 
 log = logging.getLogger(__name__)
 
@@ -144,8 +145,6 @@ def search_places(conn, query: str, max_results: int = 60) -> list[dict]:
 # surfaces DIFFERENT businesses than a single ranked list would. Extend as new
 # niches are campaigned; the fallback is just the configured niche verbatim.
 NICHE_QUERY_VARIANTS = {
-    "med spa": ["med spa", "medical spa", "medical aesthetics", "botox clinic",
-                "aesthetic clinic", "injectables"],
     "dentist": ["dentist", "dental office", "family dentistry",
                 "cosmetic dentist", "dental clinic"],
     "chiropractor": ["chiropractor", "chiropractic clinic", "spine clinic"],
@@ -258,7 +257,7 @@ def ai_looks_dated(conn, html: str, place: dict) -> str | None:
     site looks dated/low-quality enough that a redesign clearly helps. Returns a
     short reason if dated, else None. Catches visually-dated sites that pass the
     technical checks — the qualifier's blind spot without a browser."""
-    if not config.ANTHROPIC_API_KEY:
+    if not config.LLM_API_KEY:
         return None
     if costs.check(conn, "claude", EST_AI_QUALIFY_USD) == "block":
         return None
@@ -266,9 +265,7 @@ def ai_looks_dated(conn, html: str, place: dict) -> str | None:
     if len(snippet) < 200:  # JS shell / near-empty — can't judge, don't guess
         return None
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-        resp = client.messages.create(
+        resp = llm.create(
             model=config.MODEL_CLASSIFIER, max_tokens=200,
             system="You judge whether a local business's existing website looks "
                    "OUTDATED or low-quality from its raw HTML (no rendering). Be "
