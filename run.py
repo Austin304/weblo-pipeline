@@ -4,7 +4,13 @@
   python run.py build [limit]        # hourly: build samples for QUALIFIED leads
   python run.py draft [limit]        # calibration: write+print emails, NO send
   python run.py send [--dry-run]     # every few minutes, business hours
+                                     #   (with SEND_REQUIRE_APPROVAL on, stages each
+                                     #    email to Telegram for a phone tap instead
+                                     #    of auto-sending; --dry-run prints copy)
+  python run.py queue [limit]        # force the phone-approval staging path
   python run.py followups [--dry-run]
+  python run.py auth                 # mint/verify Gmail token.json (opens a browser
+                                     # on first run) — do this once before the daemons
   python run.py status               # print funnel counts + MTD spend
   python run.py grade <id> <ABCDEFG> <overall> [note] [--vision ABCDEFG:o]
   python run.py review <id ...>      # laptop: batch vision-grade -> ONE local
@@ -77,12 +83,38 @@ def main():
         import send_email
         limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), 30)
         send_email.draft_emails(limit=limit, regenerate="--regenerate" in sys.argv)
-    elif job == "send":
+    elif job in ("send", "queue"):
         import send_email
-        print(send_email.send_batch(dry_run=dry))
+        limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), None)
+        # With the manual phone-approval gate on (config.SEND_REQUIRE_APPROVAL),
+        # `send` STAGES to Telegram for a tap instead of auto-sending — so the
+        # existing cron `send` line never fires an unreviewed email. `--dry-run`
+        # still prints the auto-mode copy; `queue` forces staging regardless.
+        if job == "queue" or (config.SEND_REQUIRE_APPROVAL and not dry):
+            print(send_email.queue_batch(limit=limit))
+        else:
+            print(send_email.send_batch(dry_run=dry))
     elif job == "followups":
         import send_email
         print(send_email.send_followups(dry_run=dry))
+    elif job == "auth":
+        # One-liner to mint/verify token.json before starting the daemons. On a
+        # fresh box gmail_service() opens a browser for consent (needs credentials.json
+        # + SENDER_EMAIL/SENDER_NAME); on a headless VM, mint on the laptop and copy
+        # token.json over. getProfile() confirms the token can actually reach Gmail.
+        import send_email
+        if not (config.SENDER_EMAIL and config.SENDER_NAME):
+            print("Gmail auth NOT possible yet: set SENDER_EMAIL and SENDER_NAME in .env first.")
+            sys.exit(1)
+        try:
+            svc = send_email.gmail_service()
+            email = svc.users().getProfile(userId="me").execute().get("emailAddress")
+            print(f"Gmail auth OK — token.json valid, authenticated as {email}.")
+        except Exception as e:
+            print(f"Gmail auth FAILED: {e}")
+            print("Check that credentials.json (OAuth client) is present at the repo "
+                  "root and the OAuth consent/scopes are correct, then retry.")
+            sys.exit(1)
     elif job == "grade":
         # grade <lead_id> <ABCDEFG scores, each 1-5> <overall /10> [note...]
         #       [--vision ABCDEFG:overall]   (the AI pre-grade, for calibration)

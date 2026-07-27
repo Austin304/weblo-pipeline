@@ -18,12 +18,24 @@ import find_leads
 import llm
 import notify
 import send_email
+import write_email
 
 log = logging.getLogger(__name__)
 
 POLL_SECONDS = 75
 EST_CLASSIFY_USD = 0.01
 TG_API = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}"
+
+# Cached Gmail service for phone-approved sends (built lazily on the first ✅ Send
+# tap; google-auth refreshes the token underneath, so one instance lasts the run).
+_gmail = None
+
+
+def _gmail_service():
+    global _gmail
+    if _gmail is None:
+        _gmail = send_email.gmail_service()
+    return _gmail
 
 
 # ---------------------------------------------------------------- gmail side
@@ -203,6 +215,18 @@ def handle_command(text: str):
     with db.connect() as conn:
         if cmd == "/status":
             notify.send(cmd_status(conn), markdown=False)
+        elif cmd == "/pending":
+            rows = db.get_leads_by_status(conn, "PENDING_APPROVAL")
+            if not rows:
+                notify.send("No emails awaiting approval right now.")
+            else:
+                notify.send(f"📥 {len(rows)} awaiting approval — re-sending previews:")
+                for lead in rows:
+                    notify.send(
+                        notify.approval_preview(
+                            lead, lead["email_subject"] or "(no subject)",
+                            lead["email_body"] or "(no body)"),
+                        buttons=notify.approval_buttons(lead["id"]))
         elif cmd == "/views":
             lead_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
             notify.send(cmd_views(conn, lead_id), markdown=False)
@@ -251,32 +275,138 @@ def handle_command(text: str):
             except Exception as e:
                 notify.send(f"find failed: {e}", markdown=False)
         else:
-            notify.send("Commands: /status /views [id] /handoff <id> /build <id>"
-                        " /find <niche> in <location> [count] /stop <id|email>")
+            notify.send("Commands: /status /pending /views [id] /handoff <id>"
+                        " /build <id> /find <niche> in <location> [count]"
+                        " /stop <id|email>")
+
+
+def handle_callback(cq):
+    """A tapped inline button on a phone-approval preview (send/revise/skip)."""
+    cb_id = cq.get("id")
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    mid = msg.get("message_id")
+    if chat_id != str(config.TELEGRAM_CHAT_ID):
+        notify.answer_callback(cb_id)          # ignore anyone but the operator
+        return
+    action, _, sid = (cq.get("data") or "").partition(":")
+    if not sid.isdigit():
+        notify.answer_callback(cb_id)
+        return
+    lead_id = int(sid)
+    with db.connect() as conn:
+        lead = db.get_lead(conn, lead_id)
+        if lead is None:
+            notify.answer_callback(cb_id, "Lead not found")
+            return
+        if lead["status"] != "PENDING_APPROVAL":
+            notify.answer_callback(cb_id, f"Already {lead['status']}")
+            notify.edit_message(
+                chat_id, mid,
+                f"({lead['business_name']} — already {lead['status']}, no action taken)")
+            return
+
+        if action == "send":
+            if db.is_suppressed(conn, lead["email"]):
+                db.transition(conn, lead_id, "HELD", "suppressed at approve time")
+                conn.commit()
+                notify.answer_callback(cb_id, "Suppressed — not sent")
+                notify.edit_message(
+                    chat_id, mid, f"🚫 {lead['business_name']} is suppressed — not sent.")
+                return
+            try:
+                sent = send_email.deliver(conn, _gmail_service(), lead)
+            except Exception:
+                log.exception("phone-approved send failed for lead %s", lead_id)
+                notify.answer_callback(cb_id, "Send failed — check logs")
+                return
+            if sent:
+                notify.answer_callback(cb_id, "Sent ✅")
+                notify.edit_message(
+                    chat_id, mid, f"✅ Sent to {lead['business_name']} ({lead['email']}).")
+            else:
+                notify.answer_callback(cb_id, "Nothing sent (no copy / already sent)")
+
+        elif action == "skip":
+            db.transition(conn, lead_id, "HELD", "operator skipped at approval")
+            conn.commit()
+            notify.answer_callback(cb_id, "Skipped")
+            notify.edit_message(
+                chat_id, mid, f"❌ Skipped {lead['business_name']} — held, won't auto-send.")
+
+        elif action == "revise":
+            _kv_set(conn, "revise_lead", str(lead_id))
+            notify.answer_callback(cb_id, "Reply with your changes")
+            notify.send(
+                f"✏️ What should change on the *{lead['business_name']}* email?\n"
+                "Reply with an instruction (e.g. \"shorter, mention Saturday hours\") "
+                "or paste a full rewrite — I'll redraft and re-send it for approval.")
+        else:
+            notify.answer_callback(cb_id)
+
+
+def handle_revise_reply(text: str):
+    """A free-form message that answers a pending ✏️ Revise request: redraft the
+    copy with the operator's instruction and re-send the preview for approval."""
+    with db.connect() as conn:
+        rid = _kv_get(conn, "revise_lead", "")
+        if not rid.isdigit():
+            return  # not mid-revision — ignore stray chatter
+        _kv_set(conn, "revise_lead", "")  # consume, so a later message isn't misread
+        lead = db.get_lead(conn, int(rid))
+        if lead is None or lead["status"] != "PENDING_APPROVAL":
+            notify.send("That draft is no longer pending — nothing to revise.")
+            return
+        notify.send(f"✍️ Redrafting the {lead['business_name']} email…")
+        copy = write_email.write_cold_email(conn, lead, revise_instruction=text)
+        if copy is None:
+            notify.send("Redraft didn't pass the copy checks — the previous draft is "
+                        "still pending. Try different wording, or tap ❌ Skip.")
+            return
+        subject, body = copy
+        db.update_lead(conn, lead["id"], email_subject=subject, email_body=body)
+        conn.commit()
+        lead = db.get_lead(conn, int(rid))
+        notify.send(notify.approval_preview(lead, subject, body),
+                    buttons=notify.approval_buttons(lead["id"]))
 
 
 def poll_telegram():
     with db.connect() as conn:
         offset = int(_kv_get(conn, "tg_offset", "0"))
     try:
-        r = requests.get(f"{TG_API}/getUpdates",
-                         params={"offset": offset + 1, "timeout": 25}, timeout=35)
+        r = requests.get(
+            f"{TG_API}/getUpdates",
+            params={"offset": offset + 1, "timeout": 25,
+                    "allowed_updates": json.dumps(["message", "callback_query"])},
+            timeout=35)
         updates = r.json().get("result", [])
     except requests.RequestException:
         return
     for upd in updates:
         with db.connect() as conn:
             _kv_set(conn, "tg_offset", str(upd["update_id"]))
+        cq = upd.get("callback_query")
+        if cq:
+            try:
+                handle_callback(cq)
+            except Exception:
+                log.exception("callback failed: %s", cq.get("data"))
+            continue
         msg = upd.get("message") or {}
         chat_id = str((msg.get("chat") or {}).get("id", ""))
         if chat_id != str(config.TELEGRAM_CHAT_ID):
             continue  # only the configured operator is honored
         text = msg.get("text", "")
-        if text.startswith("/"):
-            try:
+        if not text:
+            continue
+        try:
+            if text.startswith("/"):
                 handle_command(text)
-            except Exception:
-                log.exception("command failed: %s", text)
+            else:
+                handle_revise_reply(text)  # no-op unless a ✏️ Revise is pending
+        except Exception:
+            log.exception("message handling failed: %s", text)
 
 
 # ---------------------------------------------------------------- main loop

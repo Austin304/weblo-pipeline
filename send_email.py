@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 import config
 import db
+import notify
 import write_email
 
 log = logging.getLogger(__name__)
@@ -146,6 +147,78 @@ def send_batch(limit: int | None = None, dry_run: bool = False) -> dict:
             if stats["sent"] < len(batch):
                 time.sleep(random.uniform(60, 120))  # the account's survival
     log.info("send_batch done: %s", stats)
+    return stats
+
+
+def deliver(conn, service, lead) -> bool:
+    """Send a lead's already-stored cold-email copy for real, then transition
+    to EMAILED and log the send for daily-cap accounting. Shared by the manual
+    phone-approval path (watch_replies) so an approved send goes out exactly like
+    an automatic one. Returns True on success; raises on a Gmail API failure so
+    the caller can surface it. Idempotent guard: refuses if already emailed."""
+    if lead["gmail_message_id"] or lead["emailed_at"]:
+        log.info("lead %s already emailed; deliver() skipped", lead["id"])
+        return False
+    subject, body = lead["email_subject"], lead["email_body"]
+    if not subject or not body:
+        return False
+    full_body = body + canspam_footer(lead["sample_url"])
+    resp = _send(service, lead["email"], subject, full_body)
+    db.transition(conn, lead["id"], "EMAILED", "cold email sent (phone-approved)",
+                  emailed_at=db.now(),
+                  gmail_thread_id=resp.get("threadId"),
+                  gmail_message_id=resp.get("id"))
+    db.record_send(conn, lead["id"], "cold")
+    conn.commit()
+    return True
+
+
+def queue_batch(limit: int | None = None) -> dict:
+    """Approval-mode counterpart to send_batch (config.SEND_REQUIRE_APPROVAL):
+    draft cold-email copy for eligible SAMPLE_BUILT leads, park them at
+    PENDING_APPROVAL, and push each to Telegram with Send/Revise/Skip buttons.
+    NOTHING is emailed here — the operator releases each send by tapping ✅ Send
+    on their phone (handled in watch_replies). The daily cap counts today's sends
+    PLUS anything already awaiting a tap, so the phone never gets flooded past the
+    day's budget."""
+    stats = {"queued": 0, "already_pending": 0, "suppressed": 0,
+             "no_copy": 0, "cap_left": 0}
+    if not _preflight():
+        return stats
+    with db.connect() as conn:
+        pending = len(db.get_leads_by_status(conn, "PENDING_APPROVAL"))
+        stats["already_pending"] = pending
+        room = config.DAILY_SEND_CAP - db.sent_today(conn) - pending
+        stats["cap_left"] = max(room, 0)
+        if room <= 0:
+            log.info("queue_batch: no room (cap %s, sent %s, pending %s)",
+                     config.DAILY_SEND_CAP, db.sent_today(conn), pending)
+            return stats
+        leads = [
+            l for l in db.get_leads_by_status(conn, "SAMPLE_BUILT")
+            if l["email_status"] == "found" and l["email"]
+            and l["emailed_at"] is None and l["gmail_message_id"] is None
+        ]
+        cap = min(room, limit or room)
+        for lead in leads:
+            if stats["queued"] >= cap:
+                break
+            if db.is_suppressed(conn, lead["email"]):
+                stats["suppressed"] += 1
+                continue
+            copy = write_email.write_cold_email(conn, lead)
+            if copy is None:
+                stats["no_copy"] += 1
+                continue
+            subject, body = copy
+            db.update_lead(conn, lead["id"], email_subject=subject, email_body=body)
+            db.transition(conn, lead["id"], "PENDING_APPROVAL",
+                          "queued for phone approval")
+            conn.commit()
+            notify.send(notify.approval_preview(lead, subject, body),
+                        buttons=notify.approval_buttons(lead["id"]))
+            stats["queued"] += 1
+    log.info("queue_batch done: %s", stats)
     return stats
 
 

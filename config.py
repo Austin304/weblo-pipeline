@@ -54,6 +54,13 @@ def get_float(key: str, default: float) -> float:
         return default
 
 
+def get_bool(key: str, default: bool) -> bool:
+    val = get(key, None)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
 # --- core ---
 ANTHROPIC_API_KEY = get("ANTHROPIC_API_KEY")
 # LLM provider: "moonshot" (Kimi, default) or "anthropic" (Claude, the flip-back for
@@ -97,6 +104,11 @@ GMAIL_TOKEN_PATH = str(_HERE / "token.json")
 DAILY_SEND_CAP = get_int("DAILY_SEND_CAP", 10)
 BUSINESS_MAILING_ADDRESS = get("BUSINESS_MAILING_ADDRESS", "")
 FOLLOWUP_AFTER_DAYS = get_int("FOLLOWUP_AFTER_DAYS", 6)
+# Manual phone-approval gate. When true (the launch default), `run.py send`/`queue`
+# STAGES each cold email as PENDING_APPROVAL and pushes it to Telegram with
+# Send / Revise / Skip buttons — nothing leaves Gmail until the operator taps Send
+# from their phone. Set false to restore fully-automatic sending (doc 05 ramp).
+SEND_REQUIRE_APPROVAL = get_bool("SEND_REQUIRE_APPROVAL", True)
 
 # --- standing campaign ---
 # ACTIVE NICHE IS DENTISTS ONLY (see NICHE.md). CAMPAIGN_NICHE should be "dentist".
@@ -129,10 +141,12 @@ else:  # moonshot (Kimi)
 
 # --- sample generation: best-of-N (turn generation variance into a selection asset) ---
 # For each lead, generate this many diverse candidate samples (one per design
-# language) and ship the one a pairwise vision tournament judges best. 1 = legacy
-# single-shot. >1 REQUIRES Playwright (the calibration laptop has it); the build
-# auto-falls back to single-shot wherever Playwright is unavailable (e.g. the VM).
-BEST_OF_N = get_int("BEST_OF_N", 4)
+# language) and ship the one a pairwise vision tournament judges best. 1 = single-
+# shot (DEFAULT): the operator's taste now steers GENERATION directly (see taste.py /
+# taste_profile.md), so we no longer pay to generate N and vision-judge C(N,2) pairs
+# to pick one — generate one aimed at the taste and ship it. Set >1 to re-enable the
+# tournament (REQUIRES Playwright; auto-falls back to single-shot without it).
+BEST_OF_N = get_int("BEST_OF_N", 1)
 
 # --- budgets (doc 08) ---
 PIPELINE_MONTHLY_BUDGET_USD = get_float("PIPELINE_MONTHLY_BUDGET_USD", 150)

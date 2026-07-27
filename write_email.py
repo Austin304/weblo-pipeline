@@ -78,11 +78,20 @@ def _profile_context(lead) -> str:
     )
 
 
-def write_cold_email(conn, lead) -> tuple[str, str] | None:
+def write_cold_email(conn, lead,
+                     revise_instruction: str | None = None) -> tuple[str, str] | None:
     archetype = ARCHETYPES[lead["id"] % len(ARCHETYPES)]
+    # When the operator taps ✏️ Revise on the phone-approval preview, their
+    # instruction (or a full rewrite) is honored above all else on the redraft.
+    revise_block = ""
+    if revise_instruction:
+        revise_block = (
+            "\nOPERATOR REVISION (highest priority — the operator reviewed the last "
+            "draft and wants this changed; honor it while keeping every hard rule "
+            f"below):\n{revise_instruction.strip()}\n")
     for attempt in range(2):
         prompt = f"""Write ONE cold outreach email to this local business. I built them a free sample website; the email's only job is to get them to look at it.
-
+{revise_block}
 HARD RULES:
 - 40-110 words. Shorter beats longer. Plain text, one real person to another.
 - EXACTLY ONE link, used as the call to action: {lead['sample_url']}  (use it exactly, no shorteners)

@@ -153,7 +153,11 @@ GRADE_FACTORS = ("hero", "design", "layout", "imagery", "copy", "trust", "beats"
 VALID_TRANSITIONS = {
     "FOUND": {"QUALIFIED", "SKIP", "PHONE_ONLY"},
     "QUALIFIED": {"SAMPLE_BUILT", "SAMPLE_FAILED"},
-    "SAMPLE_BUILT": {"EMAILED", "PHONE_ONLY"},
+    # PENDING_APPROVAL is the manual phone-approval hold (config.SEND_REQUIRE_APPROVAL):
+    # copy is drafted and waiting on the operator's tap. HELD = operator tapped Skip.
+    "SAMPLE_BUILT": {"EMAILED", "PHONE_ONLY", "PENDING_APPROVAL"},
+    "PENDING_APPROVAL": {"EMAILED", "HELD", "SAMPLE_BUILT"},
+    "HELD": {"PENDING_APPROVAL", "SAMPLE_BUILT"},
     "EMAILED": {"REPLIED_INTERESTED", "CLOSED_LOST", "OPTED_OUT", "BOUNCED"},
     "REPLIED_INTERESTED": {"HANDED_OFF"},
     "HANDED_OFF": {"AUTHORIZED"},
