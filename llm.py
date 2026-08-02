@@ -38,10 +38,16 @@ _client = None  # cached provider SDK client
 # so on Kimi the reasoning would eat the whole budget and truncate the answer to ''
 # (breaking JSON parsing — and fact_check fails OPEN). We add headroom centrally so
 # each call keeps its intended ANSWER budget after reasoning, without re-tuning every
-# site. Reasoning tokens observed ~50-400 for classify/judge; 1500 covers heavier
-# reasoning over large fact-check pages with margin. Billed as output (unavoidable
-# with a reasoning model), but tiny in absolute terms on the small calls.
-_REASONING_HEADROOM = 1500
+# site.
+#
+# 1500 was NOT enough and was silently corrupting the qualifier. Measured 2026-08-02
+# on real 18k-char dental homepages: reasoning alone ran 1526, 1549, and 1750+ tokens
+# — the last hit the cap and returned an EMPTY answer. In ai_site_verdict an empty
+# answer parses as "not dated", i.e. `SKIP: site looks modern`, so an unknown share
+# of the 86% rejection rate was truncation, not judgment. Raising the cap is close to
+# free: reasoning stops when the model is done, so this only prevents truncation, it
+# doesn't buy more tokens on calls that never needed them.
+_REASONING_HEADROOM = 3000
 
 
 def available() -> bool:

@@ -274,6 +274,24 @@ def ai_site_verdict(conn, html: str, place: dict) -> tuple[str | None, str]:
     snippet = _trim_html_for_ai(html)
     if len(snippet) < 200:  # JS shell / near-empty — can't judge, don't guess
         return None, ""
+    verdict = _verdict_call(conn, snippet, place)
+    if verdict == "TRUNCATED":
+        # The reasoning ran long on a big page and left no room for the answer.
+        # Retry on a much smaller snippet rather than silently scoring it SKIP —
+        # a swallowed answer used to read as "site looks modern" and throw the
+        # lead away. Half the HTML is plenty to judge structure and CTAs.
+        log.warning("ai_qualify truncated on %s; retrying on a shorter snippet",
+                    (place.get("displayName") or {}).get("text", "?"))
+        verdict = _verdict_call(conn, snippet[:8000], place)
+        if verdict == "TRUNCATED":
+            log.warning("ai_qualify truncated again; leaving unjudged")
+            return None, ""
+    return verdict
+
+
+def _verdict_call(conn, snippet: str, place: dict):
+    """One verdict attempt. Returns (tier, reason), or the sentinel "TRUNCATED"
+    when the model's reasoning consumed the whole budget and left no answer."""
     try:
         resp = llm.create(
             model=config.MODEL_CLASSIFIER, max_tokens=250,
@@ -306,7 +324,13 @@ def ai_site_verdict(conn, html: str, place: dict) -> tuple[str | None, str]:
                                        resp.usage.input_tokens,
                                        resp.usage.output_tokens))
         conn.commit()
-        data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+        text = resp.content[0].text
+        # A reasoning model that ran out of budget returns an empty answer. That
+        # is NOT "the site is fine" — say so explicitly so the caller can retry,
+        # instead of quietly throwing a qualified lead away.
+        if resp.stop_reason == "max_tokens" or not text.strip():
+            return "TRUNCATED"
+        data = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
         # dated wins when both fire — it's the stronger, more concrete pitch
         if data.get("dated"):
             return "dated", (data.get("dated_reason") or "dated design").strip()[:60]
