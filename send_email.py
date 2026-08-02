@@ -8,7 +8,7 @@ import base64
 import logging
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
 
@@ -55,11 +55,22 @@ def canspam_footer(sample_url: str) -> str:
     )
 
 
+def _tz(tz_name: str | None):
+    """A ZoneInfo for the lead, or None if this box has no tz database at all.
+    The old two-step fallback re-raised when `tzdata` was missing (Windows ships
+    no system zoneinfo), and an exception here kills the whole send job — the
+    exact silent-stall failure the heartbeat exists to catch. Degrade instead."""
+    for key in (tz_name, "America/Chicago"):
+        if key:
+            try:
+                return ZoneInfo(key)
+            except Exception:
+                continue
+    return None  # datetime.now(None) == naive system local time
+
+
 def in_send_window(tz_name: str) -> bool:
-    try:
-        local = datetime.now(ZoneInfo(tz_name or "America/Chicago"))
-    except Exception:
-        local = datetime.now(ZoneInfo("America/Chicago"))
+    local = datetime.now(_tz(tz_name))
     return local.weekday() < 5 and 9 <= local.hour < 17
 
 
@@ -173,6 +184,57 @@ def deliver(conn, service, lead) -> bool:
     return True
 
 
+def next_window_text(tz_name: str) -> str:
+    """Human phrasing of when a lead's 9-5 send window next opens — so the
+    approval receipt can say WHEN it will go instead of just 'later'."""
+    local = datetime.now(_tz(tz_name))
+    if local.weekday() < 5 and local.hour < 9:
+        return "9am their time"
+    days = 1
+    while (local + timedelta(days=days)).weekday() >= 5:
+        days += 1
+    return "9am their time tomorrow" if days == 1 else "9am Monday their time"
+
+
+def flush_approved(limit: int | None = None) -> dict:
+    """Send leads the operator already approved (tapped ✅ outside the recipient's
+    business hours) now that their window is open. Called by the `send` cron, so
+    an evening tap becomes a next-morning delivery with no further action."""
+    stats = {"sent": 0, "waiting": 0, "cap_left": 0, "suppressed": 0}
+    with db.connect() as conn:
+        approved = db.get_leads_by_status(conn, "APPROVED")
+        if not approved:
+            return stats
+        cap_left = config.DAILY_SEND_CAP - db.sent_today(conn)
+        stats["cap_left"] = max(cap_left, 0)
+        if cap_left <= 0:
+            stats["waiting"] = len(approved)
+            return stats
+        due = [l for l in approved if in_send_window(l["timezone"])]
+        stats["waiting"] = len(approved) - len(due)
+        if not due:
+            return stats
+        service = gmail_service()
+        for lead in due[: min(cap_left, limit or cap_left)]:
+            if db.is_suppressed(conn, lead["email"]):
+                db.transition(conn, lead["id"], "HELD", "suppressed before delayed send")
+                conn.commit()
+                stats["suppressed"] += 1
+                continue
+            try:
+                if deliver(conn, service, lead):
+                    stats["sent"] += 1
+                    notify.send(
+                        f"📤 Sent to *{lead['business_name']}* — the one you "
+                        f"approved outside their business hours just went out.")
+            except Exception:
+                log.exception("flush_approved: send failed for lead %s", lead["id"])
+                continue
+            time.sleep(random.uniform(60, 120))  # same pacing as a normal batch
+    log.info("flush_approved done: %s", stats)
+    return stats
+
+
 def queue_batch(limit: int | None = None) -> dict:
     """Approval-mode counterpart to send_batch (config.SEND_REQUIRE_APPROVAL):
     draft cold-email copy for eligible SAMPLE_BUILT leads, park them at
@@ -181,14 +243,18 @@ def queue_batch(limit: int | None = None) -> dict:
     on their phone (handled in watch_replies). The daily cap counts today's sends
     PLUS anything already awaiting a tap, so the phone never gets flooded past the
     day's budget."""
-    stats = {"queued": 0, "already_pending": 0, "suppressed": 0,
-             "no_copy": 0, "cap_left": 0}
+    stats = {"queued": 0, "already_pending": 0, "approved_waiting": 0,
+             "suppressed": 0, "no_copy": 0, "cap_left": 0}
     if not _preflight():
         return stats
     with db.connect() as conn:
         pending = len(db.get_leads_by_status(conn, "PENDING_APPROVAL"))
         stats["already_pending"] = pending
-        room = config.DAILY_SEND_CAP - db.sent_today(conn) - pending
+        # APPROVED leads are committed sends still waiting on a business-hours
+        # slot — they must count against today's room or the cap overshoots.
+        approved = len(db.get_leads_by_status(conn, "APPROVED"))
+        stats["approved_waiting"] = approved
+        room = config.DAILY_SEND_CAP - db.sent_today(conn) - pending - approved
         stats["cap_left"] = max(room, 0)
         if room <= 0:
             log.info("queue_batch: no room (cap %s, sent %s, pending %s)",

@@ -15,6 +15,13 @@ LOB_API_KEY_TEST=
 LOB_API_KEY_LIVE=
 PEXELS_API_KEY=
 
+# --- EMAIL SEND TRACK: fill these to turn on cold email ---
+SENDER_EMAIL=                  # the Gmail you send from (MUST match credentials.json's authorized account)
+SENDER_NAME=                   # your from-name shown to recipients, e.g. "Austin"
+DAILY_SEND_CAP=10              # max messages/day (cold + follow-ups share this budget)
+SEND_REQUIRE_APPROVAL=true     # phone-approval gate: stage each email to Telegram for a ✅ tap; never auto-send
+# GMAIL_OAUTH_CREDENTIALS=credentials.json   # optional; path to the downloaded OAuth client json (default shown)
+
 # --- CONFIG (pre-filled, non-secret) ---
 LLM_PROVIDER=moonshot                # "moonshot" (Kimi, active default) or "anthropic" (Claude, A/B flip-back)
 MOONSHOT_BASE_URL=https://api.moonshot.ai/v1
@@ -27,6 +34,16 @@ DB_PATH=leads.db
 CAMPAIGN_LOCATION=Dallas, TX
 CAMPAIGN_NICHE=dentist
 CAMPAIGN_TARGET_COUNT=50
+# Qualification breadth. true = also accept a MODERN-looking site that converts
+# badly (no booking CTA, phone buried, no service detail) as the tier WEAK,
+# pitched on lost bookings rather than on looking dated. The dated-only gate
+# rejected 86% of every batch and starved the funnel to ~2 sendable leads/week.
+QUALIFY_ACCEPT_WEAK=true
+# Multi-metro sweep, semicolon-separated. One Places call returns only ~20 results
+# and pagination is dead, so each metro needs sub-areas to actually harvest it.
+# Metros picked for Central TZ + in-state (TX return address stays local) + high
+# independent-practice density. Overrides CAMPAIGN_LOCATION for the find stage.
+CAMPAIGN_AREAS=Dallas, TX; Plano, TX; Frisco, TX; Arlington, TX; Houston, TX; Katy, TX; Sugar Land, TX; The Woodlands, TX; San Antonio, TX; Schertz, TX; New Braunfels, TX; Boerne, TX
 LOB_MODE=test                  # flip to "live" only after approving a real batch
 MAIL_FROM_NAME=Weblo                # your name / "Weblo"
 MAIL_FROM_LINE1=9041 Garland Rd Unit 2081               # the UPS Store / PO box address

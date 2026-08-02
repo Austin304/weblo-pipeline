@@ -152,11 +152,20 @@ GRADE_FACTORS = ("hero", "design", "layout", "imagery", "copy", "trust", "beats"
 
 VALID_TRANSITIONS = {
     "FOUND": {"QUALIFIED", "SKIP", "PHONE_ONLY"},
+    # SKIP is no longer terminal: `run.py requalify` re-judges already-paid-for
+    # leads under the current (broader) gate, so a lead skipped as "site looks
+    # modern" can be promoted without re-spending on Places.
+    "SKIP": {"QUALIFIED", "PHONE_ONLY"},
     "QUALIFIED": {"SAMPLE_BUILT", "SAMPLE_FAILED"},
     # PENDING_APPROVAL is the manual phone-approval hold (config.SEND_REQUIRE_APPROVAL):
     # copy is drafted and waiting on the operator's tap. HELD = operator tapped Skip.
     "SAMPLE_BUILT": {"EMAILED", "PHONE_ONLY", "PENDING_APPROVAL"},
-    "PENDING_APPROVAL": {"EMAILED", "HELD", "SAMPLE_BUILT"},
+    # APPROVED = the operator tapped ✅ outside the RECIPIENT's 9-5 window. The
+    # decision is made and final; the send just waits for a business-hours slot
+    # so a cold email from a warming domain never lands at 10pm. The `send` cron
+    # flushes these (send_email.flush_approved).
+    "PENDING_APPROVAL": {"EMAILED", "HELD", "SAMPLE_BUILT", "APPROVED"},
+    "APPROVED": {"EMAILED", "HELD"},
     "HELD": {"PENDING_APPROVAL", "SAMPLE_BUILT"},
     "EMAILED": {"REPLIED_INTERESTED", "CLOSED_LOST", "OPTED_OUT", "BOUNCED"},
     "REPLIED_INTERESTED": {"HANDED_OFF"},
@@ -299,6 +308,18 @@ def log_visit(conn, lead_id: int, source: str, user_agent: str, ip: str,
         (lead_id, now(), source, user_agent, ip, referrer),
     )
     return first
+
+
+def kv_get(conn, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def kv_set(conn, key: str, value: str):
+    conn.execute(
+        "INSERT INTO kv (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)),
+    )
 
 
 def counts_by_status(conn) -> dict:

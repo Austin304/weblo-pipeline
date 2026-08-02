@@ -314,6 +314,22 @@ def handle_callback(cq):
                 notify.edit_message(
                     chat_id, mid, f"🚫 {lead['business_name']} is suppressed — not sent.")
                 return
+            # The operator is at work on weekdays and mostly taps early or late.
+            # Approving outside the RECIPIENT's 9-5 shouldn't mean a cold email
+            # lands at 10pm, and shouldn't mean he has to remember to come back:
+            # bank the decision and let the send cron flush it at the window.
+            if not send_email.in_send_window(lead["timezone"]):
+                db.transition(conn, lead_id, "APPROVED",
+                              "operator approved outside recipient business hours")
+                conn.commit()
+                when = send_email.next_window_text(lead["timezone"])
+                notify.answer_callback(cb_id, f"Approved — goes out {when}")
+                notify.edit_message(
+                    chat_id, mid,
+                    f"⏰ Approved {lead['business_name']} — it's outside their "
+                    f"business hours, so it sends automatically at {when}. "
+                    f"Nothing else for you to do.")
+                return
             try:
                 sent = send_email.deliver(conn, _gmail_service(), lead)
             except Exception:

@@ -122,6 +122,14 @@ CAMPAIGN_TARGET_COUNT = get_int("CAMPAIGN_TARGET_COUNT", 50)
 # CAMPAIGN_LOCATION when unset.
 CAMPAIGN_AREAS = [a.strip() for a in (get("CAMPAIGN_AREAS", "") or "").split(";")
                   if a.strip()]
+# Qualification breadth. The original gate only accepted NO_SITE (no real web
+# presence) and OUTDATED (visibly dated). That rejected 86% of every batch as
+# "site looks modern" and — because emailability tracks having-a-site-to-scrape
+# (62% of OUTDATED leads yielded an email vs 6% of NO_SITE) — starved the funnel
+# to ~2 sendable leads/week. With this on, a technically-clean but weakly-
+# CONVERTING site qualifies as the third tier WEAK, pitched on lost bookings
+# rather than on looking dated. Set false to restore the dated-only gate.
+QUALIFY_ACCEPT_WEAK = get_bool("QUALIFY_ACCEPT_WEAK", True)
 
 # --- models ---
 # Three tiers, swapped as a set by LLM_PROVIDER so an A/B flip stays one env var:

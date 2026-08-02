@@ -252,33 +252,54 @@ def _trim_html_for_ai(html: str, limit: int = 18000) -> str:
     return cleaned[:limit]
 
 
-def ai_looks_dated(conn, html: str, place: dict) -> str | None:
-    """Read the raw HTML (no rendering) and CONSERVATIVELY judge whether the
-    site looks dated/low-quality enough that a redesign clearly helps. Returns a
-    short reason if dated, else None. Catches visually-dated sites that pass the
-    technical checks — the qualifier's blind spot without a browser."""
+def ai_site_verdict(conn, html: str, place: dict) -> tuple[str | None, str]:
+    """Read the raw HTML (no rendering) and judge a technically-clean site on TWO
+    independent axes, in one call:
+
+      ("dated", reason) — visibly old/low-quality; a redesign obviously helps.
+                          Judged CONSERVATIVELY: a false "dated" makes a bad
+                          pitch, which is worse than skipping.
+      ("weak",  reason) — looks contemporary but CONVERTS badly: no clear
+                          call-to-action, no online booking, buried phone
+                          number, thin//missing service content, not
+                          mobile-friendly. A real, provable complaint that
+                          doesn't require calling their design ugly.
+      (None,    "")     — a competent site with no honest complaint. Skip it.
+
+    "weak" only qualifies when config.QUALIFY_ACCEPT_WEAK is on (see qualify)."""
     if not config.LLM_API_KEY:
-        return None
+        return None, ""
     if costs.check(conn, "claude", EST_AI_QUALIFY_USD) == "block":
-        return None
+        return None, ""
     snippet = _trim_html_for_ai(html)
     if len(snippet) < 200:  # JS shell / near-empty — can't judge, don't guess
-        return None
+        return None, ""
     try:
         resp = llm.create(
-            model=config.MODEL_CLASSIFIER, max_tokens=200,
-            system="You judge whether a local business's existing website looks "
-                   "OUTDATED or low-quality from its raw HTML (no rendering). Be "
-                   "CONSERVATIVE: only say dated on CLEAR signals — table-based "
+            model=config.MODEL_CLASSIFIER, max_tokens=250,
+            system="You judge a local business's existing website from its raw "
+                   "HTML (no rendering), on two SEPARATE axes.\n\n"
+                   "DATED — does it look visually old/low-quality? Be "
+                   "CONSERVATIVE: only true on CLEAR signals — table-based "
                    "layout, <font>/inline formatting tags, no responsive CSS "
-                   "(flex/grid/media queries), ancient frameworks, pre-2015 design "
-                   "patterns, broken/sparse structure. If it looks like a competent "
-                   "modern site, say NOT dated. A false 'dated' causes a bad pitch, "
-                   "which is worse than skipping.",
+                   "(flex/grid/media queries), ancient frameworks, pre-2015 "
+                   "design patterns, broken/sparse structure. A competent "
+                   "modern site is NOT dated.\n\n"
+                   "WEAK — regardless of looks, does it fail to convert a "
+                   "visitor into a booking? True on CLEAR, checkable signals: "
+                   "no prominent call-to-action, no online booking/appointment "
+                   "path, phone number not in the header, no service detail, "
+                   "no missing-viewport/responsive handling, no trust content "
+                   "(reviews/credentials/team). Judge only what the HTML shows "
+                   "— never guess about speed or images you cannot see.\n\n"
+                   "A polished site with a clear booking CTA is neither. Say so; "
+                   "reporting no problem is always better than inventing one.",
             messages=[{"role": "user", "content":
                        f"Business: {(place.get('displayName') or {}).get('text','')}\n"
                        f"Judge this site's HTML. Return STRICT JSON only: "
-                       f'{{"dated": true|false, "reason": "<=8 words"}}\n\nHTML:\n{snippet}'}],
+                       f'{{"dated": true|false, "dated_reason": "<=8 words", '
+                       f'"weak": true|false, "weak_reason": "<=8 words"}}'
+                       f"\n\nHTML:\n{snippet}"}],
         )
         costs.record(conn, "claude", "ai_qualify",
                      costs.claude_cost(config.MODEL_CLASSIFIER,
@@ -286,17 +307,20 @@ def ai_looks_dated(conn, html: str, place: dict) -> str | None:
                                        resp.usage.output_tokens))
         conn.commit()
         data = json.loads(re.search(r"\{.*\}", resp.content[0].text, re.S).group(0))
+        # dated wins when both fire — it's the stronger, more concrete pitch
         if data.get("dated"):
-            return (data.get("reason") or "dated design").strip()[:60]
+            return "dated", (data.get("dated_reason") or "dated design").strip()[:60]
+        if data.get("weak"):
+            return "weak", (data.get("weak_reason") or "weak conversion path").strip()[:60]
     except (AttributeError, json.JSONDecodeError):
         log.warning("ai_qualify unparseable response")
     except Exception:
         log.exception("ai_qualify failed")
-    return None
+    return None, ""
 
 
 def qualify(conn, place: dict) -> tuple[str, str]:
-    """Returns (NO_SITE | OUTDATED | SKIP, reason)."""
+    """Returns (NO_SITE | OUTDATED | WEAK | SKIP, reason)."""
     if place.get("businessStatus") not in (None, "OPERATIONAL"):
         return "SKIP", f"business_status={place.get('businessStatus')}"
     if (place.get("userRatingCount") or 0) < 5:
@@ -350,9 +374,13 @@ def qualify(conn, place: dict) -> tuple[str, str]:
     # was producing false OUTDATED pitches to businesses whose live sites are
     # actually strong (e.g. Euro Image, Injexed). The AI judge flags genuine
     # non-responsiveness / dating from the HTML itself.
-    ai_reason = ai_looks_dated(conn, html, place)
-    if ai_reason:
+    verdict, ai_reason = ai_site_verdict(conn, html, place)
+    if verdict == "dated":
         return "OUTDATED", f"AI: {ai_reason}"
+    if verdict == "weak" and config.QUALIFY_ACCEPT_WEAK:
+        # contemporary-looking but leaking bookings — a different pitch, not a
+        # weaker lead (these convert BEST on email discovery: they have a site)
+        return "WEAK", f"AI: {ai_reason}"
     return "SKIP", "site looks modern"
 
 
@@ -602,6 +630,101 @@ def top_up(location: str | None = None, niche: str | None = None,
             time.sleep(0.5)  # be polite to scraped sites
 
     log.info("find_leads done: %s", stats)
+    return stats
+
+
+# ------------------------------------------------------------- requalify
+
+# Extra name keywords per niche, so a lead Places filed under the useless
+# category "establishment" is still matched to the active campaign.
+NICHE_NAME_TERMS = {
+    "dentist": ["dental", "smile", "orthodont", "endodont", "periodont",
+                "oral surgery", "dds"],
+}
+
+
+def _niche_filter(niche: str) -> tuple[str, list[str]]:
+    """SQL fragment + params matching leads in `niche` by category or name."""
+    base = (niche or "").strip().lower().rstrip("s")
+    if not base:
+        return "1=1", []
+    terms = [base] + NICHE_NAME_TERMS.get(base, [])
+    clauses = ["lower(category) LIKE ?"] + ["lower(business_name) LIKE ?"] * len(terms)
+    return "(" + " OR ".join(clauses) + ")", [f"%{base}%"] + [f"%{t}%" for t in terms]
+
+
+def requalify(limit: int | None = None, niche: str | None = None) -> dict:
+    """Re-judge leads already SKIPped as "site looks modern" under the CURRENT
+    gate (config.QUALIFY_ACCEPT_WEAK), and run email discovery on the survivors.
+
+    This spends NO Places quota — the listing data was already bought and stored;
+    the only cost is one site fetch + one cheap classifier call per lead. It
+    exists because the gate that rejected these leads was far stricter than the
+    business needed, and the rejects are the most emailable leads in the DB (they
+    all have a website to scrape an address from, unlike NO_SITE leads).
+
+    Only leads that end up with a REAL email are promoted to QUALIFIED. A
+    qualified-but-unreachable lead would otherwise flow into `build` and burn
+    generation spend on someone who can never be contacted.
+
+    Scoped to the active campaign niche so retired niches stay retired.
+    """
+    niche = niche or config.CAMPAIGN_NICHE
+    stats = {"considered": 0, "still_modern": 0, "promoted": 0,
+             "no_email": 0, "deduped": 0, "unreachable": 0}
+    where, params = _niche_filter(niche)
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM leads WHERE status = 'SKIP'"
+            "  AND qualify_status = 'SKIP'"
+            "  AND qualify_reason = 'site looks modern'"
+            "  AND existing_website IS NOT NULL AND existing_website <> ''"
+            f" AND {where}"
+            " ORDER BY review_count DESC", params,
+        ).fetchall()
+        log.info("requalify: %d candidate(s) in niche '%s'", len(rows), niche)
+        for row in rows:
+            if limit and stats["considered"] >= limit:
+                break
+            stats["considered"] += 1
+            website = row["existing_website"]
+            # rebuild the minimal shape qualify() reads from a Places result
+            place = {
+                "businessStatus": "OPERATIONAL",
+                "userRatingCount": row["review_count"],
+                "websiteUri": website,
+                "displayName": {"text": row["business_name"]},
+                "rating": row["rating"],
+            }
+            q_status, q_reason = qualify(conn, place)
+            if q_status == "SKIP":
+                stats["still_modern"] += 1
+                # remember the re-judgment so a later pass doesn't re-pay for it
+                db.update_lead(conn, row["id"], qualify_reason=q_reason)
+                conn.commit()
+                continue
+
+            email, email_status = find_email(conn, place, website)
+            if email and db.is_duplicate(conn, None, email):
+                stats["deduped"] += 1
+                continue
+            db.update_lead(conn, row["id"], qualify_status=q_status,
+                           qualify_reason=q_reason, email=email,
+                           email_status=email_status,
+                           email_verified=1 if email_status == "found" else 0)
+            if email_status != "found":
+                # keep the upgraded verdict, but do NOT promote — an unreachable
+                # lead in QUALIFIED just burns sample-build spend
+                stats["no_email"] += 1
+                stats["unreachable"] += 1
+                conn.commit()
+                continue
+            db.transition(conn, row["id"], "QUALIFIED",
+                          f"requalified {q_status}: {q_reason}")
+            stats["promoted"] += 1
+            conn.commit()
+            time.sleep(0.5)  # be polite to scraped sites
+    log.info("requalify done: %s", stats)
     return stats
 
 

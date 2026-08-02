@@ -1,4 +1,5 @@
 .env
+env-upload.txt
 *.db
 *.db-wal
 *.db-shm

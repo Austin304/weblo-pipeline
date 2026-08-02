@@ -1,6 +1,9 @@
 """Scheduler entrypoint (doc 04). Cron calls one job per invocation:
 
   python run.py find                 # weekly top-up (standing campaign config)
+  python run.py requalify [limit]    # re-judge already-paid-for SKIP leads under
+                                     #   the current gate + find their emails
+                                     #   (no Places spend; active niche only)
   python run.py build [limit]        # hourly: build samples for QUALIFIED leads
   python run.py draft [limit]        # calibration: write+print emails, NO send
   python run.py send [--dry-run]     # every few minutes, business hours
@@ -12,6 +15,10 @@
   python run.py auth                 # mint/verify Gmail token.json (opens a browser
                                      # on first run) — do this once before the daemons
   python run.py status               # print funnel counts + MTD spend
+  python run.py doctor               # full self-check (funnel, cron freshness,
+                                     #   Gmail token, samples site, spend)
+  python run.py heartbeat [--force]  # daily: push that self-check to Telegram so
+                                     #   a dead cron can never look like silence
   python run.py grade <id> <ABCDEFG> <overall> [note] [--vision ABCDEFG:o]
   python run.py review <id ...>      # laptop: batch vision-grade -> ONE local
                                      # review page (prefilled buttons, copy-all)
@@ -54,6 +61,10 @@ def main():
     if job == "find":
         import find_leads
         print(find_leads.top_up())
+    elif job == "requalify":
+        import find_leads
+        limit = next((int(a) for a in sys.argv[2:] if a.isdigit()), None)
+        print(find_leads.requalify(limit=limit))
     elif job == "build":
         import build_sample
         rest = sys.argv[2:]
@@ -91,6 +102,11 @@ def main():
         # existing cron `send` line never fires an unreviewed email. `--dry-run`
         # still prints the auto-mode copy; `queue` forces staging regardless.
         if job == "queue" or (config.SEND_REQUIRE_APPROVAL and not dry):
+            # first release anything already approved whose window has opened,
+            # THEN top the phone up — flushing first keeps the daily-cap
+            # accounting in queue_batch honest.
+            if not dry:
+                print(send_email.flush_approved())
             print(send_email.queue_batch(limit=limit))
         else:
             print(send_email.send_batch(dry_run=dry))
@@ -176,6 +192,13 @@ def main():
             sys.exit(1)
         import calibrate
         calibrate.save_exemplar(int(sys.argv[2]))
+    elif job == "doctor":
+        import health
+        health.print_report(health.check(deep="--quick" not in sys.argv))
+    elif job == "heartbeat":
+        import health
+        h = health.heartbeat(force="--force" in sys.argv)
+        print(health.summary_text(h))
     elif job == "status":
         with db.connect() as conn:
             import costs
@@ -187,6 +210,13 @@ def main():
     else:
         print(__doc__)
         sys.exit(1)
+
+    # Record that this job actually completed. health.check() reads these to
+    # distinguish "cron is running, there was simply nothing to do" from "cron
+    # is dead" — the two are indistinguishable from the phone otherwise.
+    if job in ("find", "build", "send", "queue", "requalify"):
+        import health
+        health.record_run("send" if job == "queue" else job)
 
 
 if __name__ == "__main__":

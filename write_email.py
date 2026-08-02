@@ -65,14 +65,32 @@ def _lint(subject: str, body: str, sample_url: str, max_words: int) -> str | Non
     return None
 
 
+# How to pitch, per qualification tier. WEAK leads have a site that looks fine —
+# calling it dated is both false and insulting, and it's the fastest way to get
+# the mail deleted. Pitch those on the booking path instead.
+PITCH_ANGLE = {
+    "NO_SITE": "They have NO real website. The angle is simply that they don't "
+               "have one and now they can see what theirs would look like.",
+    "OUTDATED": "Their site is genuinely dated. You may allude to it gently, but "
+                "never mock it — lead with the sample, not the criticism.",
+    "WEAK": "IMPORTANT: their current site looks perfectly modern. Do NOT say or "
+            "imply it is old, ugly, outdated, or bad — that is false and will "
+            "get this deleted. The angle is the specific booking/conversion gap "
+            "named above: their site looks good but doesn't make it easy enough "
+            "to book. Be respectful about what they already have.",
+}
+
+
 def _profile_context(lead) -> str:
     profile = json.loads(lead["source_profile"] or "{}")
     reviews = "\n".join(f"- \"{r['text'][:200]}\"" for r in (profile.get("reviews") or [])[:3])
+    angle = PITCH_ANGLE.get(lead["qualify_status"] or "", "")
     return (
         f"Business: {lead['business_name']} ({lead['category']})\n"
         f"Address: {lead['address']}\n"
         f"Rating: {lead['rating']} from {lead['review_count']} reviews\n"
         f"Their current site problem: {lead['qualify_reason'] or 'no website at all'}\n"
+        f"HOW TO PITCH THIS ONE: {angle}\n"
         f"Real review quotes:\n{reviews or '- (none pulled)'}\n"
         f"About: {profile.get('summary') or '(none)'}"
     )

@@ -175,10 +175,21 @@ cat > "$CRON_TMP" <<CRON
 # can take ~15 min with pacing, and cron fires every 3 min). send + followups
 # SHARE one lock so their sends can never overlap and together overshoot the
 # daily cap. flock releases automatically when the process exits, even on crash.
+#
+# The find/build lines are NOT optional. With them off the funnel drains and the
+# operator's phone goes quiet for a week with nothing to explain why — which is
+# exactly what happened in late July. If you need to pause outreach, leave these
+# running and turn off `send` instead: building costs cents, silence costs weeks.
 */3  *     * * *  cd ${APP_DIR} && flock -n /tmp/weblo-send.lock  .venv/bin/python run.py send      >> logs/cron.log 2>&1
 17   *     * * *  cd ${APP_DIR} && flock -n /tmp/weblo-build.lock .venv/bin/python run.py build     >> logs/cron.log 2>&1
 30   13    * * 1  cd ${APP_DIR} && flock -n /tmp/weblo-find.lock  .venv/bin/python run.py find      >> logs/cron.log 2>&1
 0    14    * * *  cd ${APP_DIR} && flock -n /tmp/weblo-send.lock  .venv/bin/python run.py followups >> logs/cron.log 2>&1
+# Re-judge already-paid-for SKIP leads under the current gate + find their
+# emails. No Places spend, so it runs daily as a cheap funnel top-up.
+45   11    * * *  cd ${APP_DIR} && flock -n /tmp/weblo-requal.lock .venv/bin/python run.py requalify 25 >> logs/cron.log 2>&1
+# The daily heartbeat. 12:30 UTC = 7:30am Central, before the operator leaves for
+# work. This is the message that makes a dead pipeline impossible to miss.
+30   12    * * *  cd ${APP_DIR} && .venv/bin/python run.py heartbeat                                >> logs/cron.log 2>&1
 CRON
 crontab -u "$SVC_USER" "$CRON_TMP"
 rm -f "$CRON_TMP"

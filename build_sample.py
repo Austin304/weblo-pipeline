@@ -22,6 +22,7 @@ import costs
 import dataset  # Step-0 durable training-data capture (pure instrumentation; non-fatal)
 import db
 import llm
+import taste  # operator's learned taste profile, injected into generation + selection (non-fatal)
 
 log = logging.getLogger(__name__)
 
@@ -634,8 +635,9 @@ def select_images(conn, lead, profile: dict, brief: dict, service_desc: str = ""
                 return survivors, "places", notes
             if survivors:
                 owner_backup = (survivors, notes)
-    # rung 2: an OUTDATED site's own images (same owner-photo bar)
-    if owner_backup is None and lead["qualify_status"] == "OUTDATED":
+    # rung 2: an existing site's own images (same owner-photo bar). WEAK leads
+    # have a real site too — their photos are just as usable as an OUTDATED one's.
+    if owner_backup is None and lead["qualify_status"] in ("OUTDATED", "WEAK"):
         imgs = site_images(lead["existing_website"])
         if imgs:
             survivors, notes = qc(imgs, "their_site")
@@ -745,6 +747,15 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
     hero_line = (f"\n\nNICHE HERO GUIDANCE (apply when scoring 'hero'; it OVERRIDES the "
                  f"generic hero notes above where they conflict): {hero_guidance}"
                  if hero_guidance else "")
+    # OPERATOR TASTE: bias the hero score toward the operator's learned imagery preference
+    # (real faces / warm people-scenes over empty rooms, reception desks, exteriors) so the
+    # hero the picker crowns matches what the operator rates YES. None -> scoring unchanged.
+    taste_line = ""
+    _tp = taste.load_profile()
+    if _tp:
+        _tb = taste.as_imagery_block(_tp)
+        if _tb:
+            taste_line = "\n\n" + _tb
     content = [{"type": "text", "text":
         f"These are candidate images for a {lead['category'] or 'local business'} "
         f"website ({kind}). For EACH image, judge how well it would work as the large "
@@ -757,7 +768,7 @@ def describe_and_rank_images(conn, lead, urls: list[str], image_source: str,
         "shot; a logo; or an obvious AMATEUR PHONE SNAPSHOT (harsh flash, tilted, messy "
         "background). Also note WHERE the main subject sits in the "
         "frame, so a CSS crop can be aimed to keep it (a wide hero crops off top and "
-        "bottom; a tall column crops off the sides)." + match_line + hero_line}]
+        "bottom; a tall column crops off the sides)." + match_line + hero_line + taste_line}]
     # Build one image block per candidate. The Anthropic image fetcher is blocked by
     # some hosts (e.g. Pixabay), so those are downloaded and sent INLINE as base64
     # (we can fetch them ourselves); other hosts stay cheap URL refs. An image that
@@ -1434,6 +1445,17 @@ def build_prompt(lead, brief: dict, archetype: str, images: list[str],
             "polish and speed. Keep their brand identity (logo/colors above) but execute it "
             "at a dramatically higher level. A result a reasonable person could call merely "
             "comparable or only slightly better than a dated small-business site is a FAILURE.")
+    elif lead["qualify_status"] == "WEAK":
+        upgrade_mandate = (
+            "CONVERSION REBUILD: their current site looks CONTEMPORARY — do NOT try to win "
+            "on 'yours looks old', because it doesn't. You win on BOOKINGS. The specific "
+            "leak is named above under THEIR CURRENT SITE'S WEAKNESS; this sample must fix "
+            "it so visibly that the owner recognizes it instantly: an unmissable primary "
+            "call-to-action above the fold, the phone number in the header, an obvious "
+            "path to book an appointment repeated down the page, clear service detail, and "
+            "trust content (reviews/credentials) where a hesitant patient will hit it. "
+            "Design quality must still clearly beat theirs — but the ARGUMENT is that this "
+            "one turns visitors into appointments and theirs doesn't.")
     else:
         upgrade_mandate = (
             "ESTABLISH THEIR PRESENCE: they have no real website today. This is their first "
@@ -2116,11 +2138,17 @@ def _pairwise_pick(conn, lead, shots_a: dict, shots_b: dict) -> tuple[str, str]:
                {"type": "text", "text": "=== SAMPLE A — full page ==="}, *_imgs({"full": shots_a.get("full")}),
                {"type": "text", "text": "=== SAMPLE B — fold ==="}, *_imgs({"fold": shots_b.get("fold")}),
                {"type": "text", "text": "=== SAMPLE B — full page ==="}, *_imgs({"full": shots_b.get("full")})]
+    judge_system = ("You are a decisive, brutally honest design director grading sample "
+                    "websites for a cold-outreach pipeline. Judge like a picky business owner.")
+    # OPERATOR TASTE: the same learned profile that steers generation also biases the pick,
+    # so the auto-winner matches what the operator would choose. None -> judge unchanged.
+    taste_profile = taste.load_profile()
+    if taste_profile:
+        judge_system += "\n\n" + taste.as_judge_block(taste_profile)
     try:
         resp = llm.create(
             model=config.MODEL_QUALITY, max_tokens=200,
-            system="You are a decisive, brutally honest design director grading sample "
-                   "websites for a cold-outreach pipeline. Judge like a picky business owner.",
+            system=judge_system,
             messages=[{"role": "user", "content": content}])
         costs.record(conn, "claude", "sample_bon_judge",
                      costs.claude_cost(config.MODEL_QUALITY, resp.usage.input_tokens,
@@ -2335,6 +2363,11 @@ def build_one(conn, lead, preview_dir=None) -> bool:
     style_ctx = _style_context(niche_key(lead["category"], lead["business_name"]))
     if style_ctx:
         system += "\n\n" + style_ctx
+    # OPERATOR TASTE: fold in what the human's YES/NO ratings taught us (taste.py). When no
+    # profile has been distilled yet, load_profile() returns None and generation is unchanged.
+    taste_profile = taste.load_profile()
+    if taste_profile:
+        system += "\n\n" + taste.as_generation_block(taste_profile)
 
     # FACTS IN CODE: assemble every verifiable fact (name, rating line, hours,
     # phone, address, verbatim 4-5★ testimonials) here so the generator places them
